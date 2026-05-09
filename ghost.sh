@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# ghost.sh - Hardened Anonymous Networking Toolkit
-# Version: 3.0
+# ghostly.sh - Hardened Anonymous Networking Toolkit
 #
 
 set -Eeuo pipefail
@@ -10,19 +9,21 @@ set -Eeuo pipefail
 # CONFIG
 ############################
 
+VERSION="2.0"
+
 TOR_PORT="9050"
 TOR_DNS_PORT="5353"
 TOR_TRANS_PORT="9040"
 TOR_CONTROL_PORT="9051"
 
-CONFIG_DIR="/etc/ghost"
-BACKUP_DIR="/var/lib/ghost"
-LOG_FILE="/var/log/ghost.log"
+CONFIG_DIR="/etc/ghostly"
+BACKUP_DIR="/var/lib/ghostly"
+LOG_FILE="/var/log/ghostly.log"
 
 TOR_USER="debian-tor"
 
-BOOTSTRAP_TIMEOUT=60   # seconds to wait for Tor bootstrap
-MAC_RETRY=3            # retries for macchanger
+BOOTSTRAP_TIMEOUT=60
+MAC_RETRY=3
 
 ############################
 # COLORS
@@ -119,13 +120,11 @@ configure_tor() {
 
     mkdir -p "$BACKUP_DIR" "$CONFIG_DIR"
 
-    # Backup existing config
     [[ -f /etc/tor/torrc ]] && \
         cp /etc/tor/torrc "$BACKUP_DIR/torrc.bak"
 
-    # Generate cookie auth password
     local hashed_pass
-    hashed_pass="$(tor --hash-password "ghost_ctrl_$(hostname)" 2>/dev/null | tail -1)"
+    hashed_pass="$(tor --hash-password "ghostly_ctrl_$(hostname)" 2>/dev/null | tail -1)"
 
     cat > /etc/tor/torrc <<EOF
 SocksPort $TOR_PORT
@@ -152,8 +151,7 @@ DNSPort $TOR_DNS_PORT
 AutomapHostsSuffixes .onion,.exit
 EOF
 
-    # Save the plaintext password for rotate_tor (root-only readable)
-    echo "ghost_ctrl_$(hostname)" > "$CONFIG_DIR/.ctrl_pass"
+    echo "ghostly_ctrl_$(hostname)" > "$CONFIG_DIR/.ctrl_pass"
     chmod 600 "$CONFIG_DIR/.ctrl_pass"
 
     systemctl restart tor
@@ -168,10 +166,8 @@ wait_for_tor() {
     log "Waiting for Tor to bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
 
     local elapsed=0
-    local journal_lines=0
 
     while (( elapsed < BOOTSTRAP_TIMEOUT )); do
-        # Check journal for 100% bootstrap
         if journalctl -u tor --since "5 minutes ago" --no-pager -q 2>/dev/null \
             | grep -q "Bootstrapped 100%"; then
             log "Tor bootstrapped successfully."
@@ -181,7 +177,6 @@ wait_for_tor() {
         (( elapsed += 2 ))
     done
 
-    # Fallback: port check
     if nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null; then
         warn "Bootstrap log not found, but SOCKS port is open. Proceeding."
         return 0
@@ -205,7 +200,7 @@ configure_dns() {
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
     cat > /etc/resolv.conf <<EOF
-# Ghost Mode - DNS via Tor
+# Ghostly - DNS via Tor
 nameserver 127.0.0.1
 options timeout:1 attempts:1
 EOF
@@ -238,8 +233,7 @@ disable_ipv6() {
     sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
     sysctl -w net.ipv6.conf.lo.disable_ipv6=1       >/dev/null
 
-    # Also persist to prevent kernel re-enable on hotplug
-    cat > /etc/sysctl.d/99-ghost-no-ipv6.conf <<EOF
+    cat > /etc/sysctl.d/99-ghostly-no-ipv6.conf <<EOF
 net.ipv6.conf.all.disable_ipv6=1
 net.ipv6.conf.default.disable_ipv6=1
 net.ipv6.conf.lo.disable_ipv6=1
@@ -249,7 +243,7 @@ EOF
 
 enable_ipv6() {
     log "Re-enabling IPv6..."
-    rm -f /etc/sysctl.d/99-ghost-no-ipv6.conf
+    rm -f /etc/sysctl.d/99-ghostly-no-ipv6.conf
     sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
     sysctl -w net.ipv6.conf.lo.disable_ipv6=0       >/dev/null
@@ -329,52 +323,42 @@ configure_firewall() {
 
     backup_iptables
 
-    # Flush all
     iptables -F
     iptables -t nat -F
     iptables -t mangle -F
     iptables -X 2>/dev/null || true
 
-    # Default DROP everything
     iptables -P INPUT   DROP
     iptables -P FORWARD DROP
     iptables -P OUTPUT  DROP
 
-    # Loopback
     iptables -A INPUT  -i lo -j ACCEPT
     iptables -A OUTPUT -o lo -j ACCEPT
 
-    # Allow established/related
     iptables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Allow Tor daemon outbound
     iptables -A OUTPUT \
         -m owner --uid-owner "$TOR_USER" \
         -j ACCEPT
 
-    # Redirect TCP (transparent proxy)
     iptables -t nat -A OUTPUT \
         -p tcp --syn \
         ! -d 127.0.0.0/8 \
         ! -m owner --uid-owner "$TOR_USER" \
         -j REDIRECT --to-ports "$TOR_TRANS_PORT"
 
-    # Redirect DNS (UDP) through Tor
     iptables -t nat -A OUTPUT \
         -p udp --dport 53 \
         -j REDIRECT --to-ports "$TOR_DNS_PORT"
 
-    # Redirect DNS (TCP) through Tor
     iptables -t nat -A OUTPUT \
         -p tcp --dport 53 \
         -j REDIRECT --to-ports "$TOR_DNS_PORT"
 
-    # Explicit drop of any DNS that bypasses NAT
     iptables -A OUTPUT -p udp --dport 53 -j DROP
     iptables -A OUTPUT -p tcp --dport 53 -j DROP
 
-    # Drop all other outbound (kill-switch)
     iptables -A OUTPUT -j DROP
 
     log "Kill-switch firewall applied."
@@ -395,7 +379,6 @@ verify_tor_ip() {
         return 1
     fi
 
-    # Check with Tor Project's check service
     local tor_check
     tor_check="$(torsocks curl -s --max-time 10 https://check.torproject.org/api/ip 2>/dev/null || true)"
 
@@ -410,12 +393,12 @@ verify_tor_ip() {
 # START
 ############################
 
-start_ghost() {
+start_ghostly() {
     require_root
     check_deps
 
     log "==============================="
-    log "  Starting Ghost Mode v3.0"
+    log "  Starting Ghostly"
     log "==============================="
 
     configure_tor
@@ -428,7 +411,7 @@ start_ghost() {
     wait_for_tor
     verify_tor_ip
 
-    log "Ghost mode ACTIVE."
+    log "Ghostly ACTIVE."
     log "All traffic is routed through Tor."
 }
 
@@ -436,11 +419,11 @@ start_ghost() {
 # STOP
 ############################
 
-stop_ghost() {
+stop_ghostly() {
     require_root
 
     log "==============================="
-    log "  Stopping Ghost Mode"
+    log "  Stopping Ghostly"
     log "==============================="
 
     restore_iptables
@@ -452,7 +435,7 @@ stop_ghost() {
 
     rm -f "$CONFIG_DIR/.ctrl_pass"
 
-    log "Ghost mode DISABLED."
+    log "Ghostly DISABLED."
     warn "Your real IP is now exposed."
 }
 
@@ -470,14 +453,13 @@ rotate_tor() {
         ctrl_pass="$(cat "$CONFIG_DIR/.ctrl_pass")"
 
     if [[ -z "$ctrl_pass" ]]; then
-        err "No control password found. Is Ghost Mode active?"
+        err "No control password found. Is Ghostly active?"
         return 1
     fi
 
     printf "AUTHENTICATE \"%s\"\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$ctrl_pass" \
         | nc 127.0.0.1 "$TOR_CONTROL_PORT" >/dev/null 2>&1
 
-    # Tor requires 10s between NEWNYM signals
     log "Waiting 10s for new circuit to establish..."
     sleep 10
 
@@ -489,10 +471,10 @@ rotate_tor() {
 # STATUS
 ############################
 
-status_ghost() {
+status_ghostly() {
     echo
     echo -e "${BLUE}=================================${NC}"
-    echo -e "${BLUE}        GHOST STATUS v3.0        ${NC}"
+    echo -e "${BLUE}          GHOSTLY STATUS         ${NC}"
     echo -e "${BLUE}=================================${NC}"
     echo
 
@@ -576,11 +558,11 @@ menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================${NC}"
-        echo -e "${BLUE}         GHOST TOOLKIT v3.0      ${NC}"
+        echo -e "${BLUE}            GHOSTLY              ${NC}"
         echo -e "${BLUE}=================================${NC}"
         echo
-        echo "  1. Enable Ghost Mode"
-        echo "  2. Disable Ghost Mode"
+        echo "  1. Enable Ghostly"
+        echo "  2. Disable Ghostly"
         echo "  3. Rotate Tor Circuit"
         echo "  4. Status"
         echo "  5. Leak Test"
@@ -590,12 +572,12 @@ menu() {
         read -rp "Select [1-6]: " choice
 
         case "$choice" in
-            1) start_ghost  ;;
-            2) stop_ghost   ;;
-            3) rotate_tor   ;;
-            4) status_ghost ;;
-            5) leak_test    ;;
-            6) exit 0       ;;
+            1) start_ghostly  ;;
+            2) stop_ghostly   ;;
+            3) rotate_tor     ;;
+            4) status_ghostly ;;
+            5) leak_test      ;;
+            6) exit 0         ;;
             *) warn "Invalid option" ;;
         esac
 
@@ -616,16 +598,16 @@ case "${1:-}" in
         install_deps
         ;;
     on|start)
-        start_ghost
+        start_ghostly
         ;;
     off|stop)
-        stop_ghost
+        stop_ghostly
         ;;
     rotate)
         rotate_tor
         ;;
     status)
-        status_ghost
+        status_ghostly
         ;;
     leak-test)
         leak_test
@@ -633,18 +615,22 @@ case "${1:-}" in
     menu)
         menu
         ;;
+    -v|--version|version)
+        echo "Ghostly v${VERSION}"
+        ;;
     *)
         echo
-        echo "Ghost Toolkit v3.0"
+        echo "Ghostly - Hardened Anonymous Networking Toolkit"
         echo
         echo "Usage:"
-        echo "  sudo ghost install     Install dependencies"
-        echo "  sudo ghost on          Enable Ghost Mode"
-        echo "  sudo ghost off         Disable Ghost Mode"
-        echo "  sudo ghost rotate      Rotate Tor circuit"
-        echo "  sudo ghost status      Show current status"
-        echo "  sudo ghost leak-test   Run leak tests"
-        echo "  sudo ghost menu        Interactive menu"
+        echo "  sudo ghostly install       Install dependencies"
+        echo "  sudo ghostly on            Enable Ghostly"
+        echo "  sudo ghostly off           Disable Ghostly"
+        echo "  sudo ghostly rotate        Rotate Tor circuit"
+        echo "  sudo ghostly status        Show current status"
+        echo "  sudo ghostly leak-test     Run leak tests"
+        echo "  sudo ghostly menu          Interactive menu"
+        echo "  ghostly --version          Show version"
         echo
         ;;
 esac
