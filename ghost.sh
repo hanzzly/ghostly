@@ -1,281 +1,650 @@
-#!/bin/bash
-# ghost.sh - Anonymous Mode Switcher
-# Usage: sudo ./ghost.sh [on|off|status|check]
+#!/usr/bin/env bash
+#
+# ghost.sh - Hardened Anonymous Networking Toolkit
+# Version: 3.0
+#
 
-# Colors
+set -Eeuo pipefail
+
+############################
+# CONFIG
+############################
+
+TOR_PORT="9050"
+TOR_DNS_PORT="5353"
+TOR_TRANS_PORT="9040"
+TOR_CONTROL_PORT="9051"
+
+CONFIG_DIR="/etc/ghost"
+BACKUP_DIR="/var/lib/ghost"
+LOG_FILE="/var/log/ghost.log"
+
+TOR_USER="debian-tor"
+
+BOOTSTRAP_TIMEOUT=60   # seconds to wait for Tor bootstrap
+MAC_RETRY=3            # retries for macchanger
+
+############################
+# COLORS
+############################
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Config
-TOR_PORT="9050"
-PRIVOXY_PORT="8118"
-LOG_FILE="/tmp/ghost.log"
+############################
+# LOGGING
+############################
 
-# Functions
 log() {
-    echo -e "${GREEN}[+]${NC} $1" | tee -a "$LOG_FILE"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "${GREEN}[+]${NC} $1"
+    echo "[$ts] [+] $1" >> "$LOG_FILE"
 }
 
-error() {
-    echo -e "${RED}[!]${NC} $1" | tee -a "$LOG_FILE"
+warn() {
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "${YELLOW}[*]${NC} $1"
+    echo "[$ts] [*] $1" >> "$LOG_FILE"
 }
 
-warning() {
-    echo -e "${YELLOW}[*]${NC} $1" | tee -a "$LOG_FILE"
+err() {
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "${RED}[!]${NC} $1" >&2
+    echo "[$ts] [!] $1" >> "$LOG_FILE"
 }
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        error "Please run as root: sudo ./ghost.sh"
-        exit 1
-    fi
+die() {
+    err "$1"
+    exit 1
 }
+
+############################
+# ROOT CHECK
+############################
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "Run as root"
+}
+
+############################
+# UTIL
+############################
+
+default_iface() {
+    ip route | awk '/default/ {print $5}' | head -n1
+}
+
+check_binary() {
+    command -v "$1" >/dev/null 2>&1 || die "Required binary not found: $1"
+}
+
+check_deps() {
+    for bin in tor nc ip iptables macchanger curl sysctl; do
+        check_binary "$bin"
+    done
+}
+
+############################
+# INSTALL
+############################
 
 install_deps() {
-    log "Checking dependencies..."
+    log "Installing dependencies..."
+    apt-get update -qq
+    apt-get install -y \
+        tor \
+        torsocks \
+        proxychains4 \
+        macchanger \
+        curl \
+        iptables \
+        iproute2 \
+        netcat-openbsd \
+        dnsutils
+    log "Dependencies installed."
+}
 
-    deps=("tor" "proxychains" "macchanger" "privoxy" "curl" "openvpn")
-    missing=()
+############################
+# TOR CONFIG
+############################
 
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            missing+=("$dep")
+configure_tor() {
+    log "Configuring Tor..."
+
+    mkdir -p "$BACKUP_DIR" "$CONFIG_DIR"
+
+    # Backup existing config
+    [[ -f /etc/tor/torrc ]] && \
+        cp /etc/tor/torrc "$BACKUP_DIR/torrc.bak"
+
+    # Generate cookie auth password
+    local hashed_pass
+    hashed_pass="$(tor --hash-password "ghost_ctrl_$(hostname)" 2>/dev/null | tail -1)"
+
+    cat > /etc/tor/torrc <<EOF
+SocksPort $TOR_PORT
+ControlPort $TOR_CONTROL_PORT
+
+## Auth
+HashedControlPassword $hashed_pass
+CookieAuthentication 0
+
+## Performance & safety
+AvoidDiskWrites 1
+HardwareAccel 1
+SafeLogging 1
+ClientOnly 1
+StrictNodes 0
+
+## Transparent proxy setup
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+TransPort $TOR_TRANS_PORT IsolateClientAddr IsolateClientProtocol
+DNSPort $TOR_DNS_PORT
+
+## Prevent DNS leak
+AutomapHostsSuffixes .onion,.exit
+EOF
+
+    # Save the plaintext password for rotate_tor (root-only readable)
+    echo "ghost_ctrl_$(hostname)" > "$CONFIG_DIR/.ctrl_pass"
+    chmod 600 "$CONFIG_DIR/.ctrl_pass"
+
+    systemctl restart tor
+    log "Tor configured."
+}
+
+############################
+# WAIT FOR TOR BOOTSTRAP
+############################
+
+wait_for_tor() {
+    log "Waiting for Tor to bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
+
+    local elapsed=0
+    local journal_lines=0
+
+    while (( elapsed < BOOTSTRAP_TIMEOUT )); do
+        # Check journal for 100% bootstrap
+        if journalctl -u tor --since "5 minutes ago" --no-pager -q 2>/dev/null \
+            | grep -q "Bootstrapped 100%"; then
+            log "Tor bootstrapped successfully."
+            return 0
         fi
+        sleep 2
+        (( elapsed += 2 ))
     done
 
-    if [ ${#missing[@]} -gt 0 ]; then
-        warning "Missing dependencies: ${missing[*]}"
-        read -p "Install? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            apt update
-            apt install -y tor proxychains macchanger privoxy curl openvpn
-            log "Dependencies installed"
-        fi
+    # Fallback: port check
+    if nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null; then
+        warn "Bootstrap log not found, but SOCKS port is open. Proceeding."
+        return 0
+    fi
+
+    die "Tor failed to bootstrap within ${BOOTSTRAP_TIMEOUT}s. Aborting."
+}
+
+############################
+# DNS
+############################
+
+configure_dns() {
+    log "Configuring DNS over Tor..."
+
+    mkdir -p "$BACKUP_DIR"
+
+    [[ -f /etc/resolv.conf ]] && \
+        cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.bak"
+
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    cat > /etc/resolv.conf <<EOF
+# Ghost Mode - DNS via Tor
+nameserver 127.0.0.1
+options timeout:1 attempts:1
+EOF
+
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+    log "DNS locked to 127.0.0.1."
+}
+
+restore_dns() {
+    log "Restoring DNS..."
+
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    if [[ -f "$BACKUP_DIR/resolv.conf.bak" ]]; then
+        cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
+        log "DNS restored."
+    else
+        warn "No DNS backup found. Falling back to 8.8.8.8."
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
     fi
 }
 
-configure_proxychains() {
-    log "Configuring proxychains..."
+############################
+# IPV6
+############################
 
-    cat > /etc/proxychains.conf << EOF
-strict_chain
-proxy_dns
-remote_dns_subnet 224
-tcp_read_time_out 15000
-tcp_connect_time_out 8000
-localnet 127.0.0.0/255.0.0.0
+disable_ipv6() {
+    log "Disabling IPv6..."
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1     >/dev/null
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=1       >/dev/null
 
-[ProxyList]
-socks5 127.0.0.1 $TOR_PORT
-socks4 127.0.0.1 $TOR_PORT
-http 127.0.0.1 $PRIVOXY_PORT
+    # Also persist to prevent kernel re-enable on hotplug
+    cat > /etc/sysctl.d/99-ghost-no-ipv6.conf <<EOF
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.lo.disable_ipv6=1
 EOF
-
-    log "Proxychains configured"
+    log "IPv6 disabled."
 }
 
-start_services() {
-    log "Starting anonymous services..."
+enable_ipv6() {
+    log "Re-enabling IPv6..."
+    rm -f /etc/sysctl.d/99-ghost-no-ipv6.conf
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0       >/dev/null
+    log "IPv6 re-enabled."
+}
 
-    # Stop networking temporarily
-    systemctl stop NetworkManager 2>/dev/null
+############################
+# MAC SPOOF
+############################
 
-    # Change MAC address
-    log "Changing MAC address..."
-    for iface in $(ls /sys/class/net/ | grep -v lo); do
-        macchanger -r "$iface" 2>/dev/null && log "MAC changed on $iface"
+spoof_mac() {
+    local iface
+    iface="$(default_iface)"
+
+    [[ -z "$iface" ]] && { err "No network interface found"; return 1; }
+
+    log "Spoofing MAC on $iface..."
+
+    local attempt=0
+    while (( attempt < MAC_RETRY )); do
+        ip link set "$iface" down
+        sleep 1
+        if macchanger -r "$iface" 2>/dev/null; then
+            ip link set "$iface" up
+            local new_mac
+            new_mac="$(cat /sys/class/net/"$iface"/address)"
+            log "MAC spoofed → $new_mac"
+            return 0
+        fi
+        ip link set "$iface" up
+        (( attempt++ ))
+        warn "MAC spoof attempt $attempt failed, retrying..."
+        sleep 2
     done
 
-    # Start Tor
-    log "Starting Tor..."
-    systemctl start tor
-    sleep 3
-
-    # Start Privoxy
-    log "Starting Privoxy..."
-    systemctl start privoxy
-
-    # Configure DNS
-    log "Configuring DNS..."
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null
-
-    # Start networking
-    systemctl start NetworkManager 2>/dev/null
-    sleep 2
-
-    # Set proxy environment
-    export http_proxy="http://127.0.0.1:$PRIVOXY_PORT"
-    export https_proxy="http://127.0.0.1:$PRIVOXY_PORT"
-    export HTTP_PROXY="http://127.0.0.1:$PRIVOXY_PORT"
-    export HTTPS_PROXY="http://127.0.0.1:$PRIVOXY_PORT"
-
-    log "Anonymous mode activated!"
+    err "MAC spoofing failed after $MAC_RETRY attempts."
 }
 
-stop_services() {
-    log "Stopping anonymous services..."
+restore_mac() {
+    local iface
+    iface="$(default_iface)"
+    [[ -z "$iface" ]] && return
 
-    # Unlock DNS
-    chattr -i /etc/resolv.conf 2>/dev/null
+    log "Restoring original MAC on $iface..."
+    ip link set "$iface" down
+    sleep 1
+    macchanger -p "$iface" 2>/dev/null || true
+    ip link set "$iface" up
+    log "MAC restored."
+}
 
-    # Stop services
+############################
+# FIREWALL
+############################
+
+backup_iptables() {
+    mkdir -p "$BACKUP_DIR"
+    iptables-save > "$BACKUP_DIR/iptables.bak"
+}
+
+restore_iptables() {
+    if [[ -f "$BACKUP_DIR/iptables.bak" ]]; then
+        iptables-restore < "$BACKUP_DIR/iptables.bak"
+        log "iptables restored."
+    else
+        warn "No iptables backup found. Flushing to ACCEPT all."
+        iptables -F
+        iptables -t nat -F
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+    fi
+}
+
+configure_firewall() {
+    log "Applying kill-switch firewall..."
+
+    backup_iptables
+
+    # Flush all
+    iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
+    iptables -X 2>/dev/null || true
+
+    # Default DROP everything
+    iptables -P INPUT   DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT  DROP
+
+    # Loopback
+    iptables -A INPUT  -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # Allow established/related
+    iptables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # Allow Tor daemon outbound
+    iptables -A OUTPUT \
+        -m owner --uid-owner "$TOR_USER" \
+        -j ACCEPT
+
+    # Redirect TCP (transparent proxy)
+    iptables -t nat -A OUTPUT \
+        -p tcp --syn \
+        ! -d 127.0.0.0/8 \
+        ! -m owner --uid-owner "$TOR_USER" \
+        -j REDIRECT --to-ports "$TOR_TRANS_PORT"
+
+    # Redirect DNS (UDP) through Tor
+    iptables -t nat -A OUTPUT \
+        -p udp --dport 53 \
+        -j REDIRECT --to-ports "$TOR_DNS_PORT"
+
+    # Redirect DNS (TCP) through Tor
+    iptables -t nat -A OUTPUT \
+        -p tcp --dport 53 \
+        -j REDIRECT --to-ports "$TOR_DNS_PORT"
+
+    # Explicit drop of any DNS that bypasses NAT
+    iptables -A OUTPUT -p udp --dport 53 -j DROP
+    iptables -A OUTPUT -p tcp --dport 53 -j DROP
+
+    # Drop all other outbound (kill-switch)
+    iptables -A OUTPUT -j DROP
+
+    log "Kill-switch firewall applied."
+}
+
+############################
+# VERIFY IP IS TOR
+############################
+
+verify_tor_ip() {
+    log "Verifying public IP is via Tor..."
+
+    local ip
+    ip="$(torsocks curl -s --max-time 10 https://ipinfo.io/ip 2>/dev/null || true)"
+
+    if [[ -z "$ip" ]]; then
+        warn "Could not fetch public IP. Check Tor connectivity."
+        return 1
+    fi
+
+    # Check with Tor Project's check service
+    local tor_check
+    tor_check="$(torsocks curl -s --max-time 10 https://check.torproject.org/api/ip 2>/dev/null || true)"
+
+    if echo "$tor_check" | grep -q '"IsTor":true'; then
+        log "Confirmed: traffic is routed through Tor. IP: $ip"
+    else
+        warn "WARNING: Tor check inconclusive. IP: $ip"
+    fi
+}
+
+############################
+# START
+############################
+
+start_ghost() {
+    require_root
+    check_deps
+
+    log "==============================="
+    log "  Starting Ghost Mode v3.0"
+    log "==============================="
+
+    configure_tor
+    spoof_mac
+    disable_ipv6
+    configure_dns
+    configure_firewall
+
+    systemctl restart tor
+    wait_for_tor
+    verify_tor_ip
+
+    log "Ghost mode ACTIVE."
+    log "All traffic is routed through Tor."
+}
+
+############################
+# STOP
+############################
+
+stop_ghost() {
+    require_root
+
+    log "==============================="
+    log "  Stopping Ghost Mode"
+    log "==============================="
+
+    restore_iptables
+    restore_dns
+    restore_mac
+    enable_ipv6
+
     systemctl stop tor
-    systemctl stop privoxy
 
-    # Reset MAC address
-    log "Resetting MAC address..."
-    for iface in $(ls /sys/class/net/ | grep -v lo); do
-        macchanger -p "$iface" 2>/dev/null && log "MAC reset on $iface"
-    done
+    rm -f "$CONFIG_DIR/.ctrl_pass"
 
-    # Reset proxy environment
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-
-    # Reset DNS
-    systemctl restart systemd-resolved
-
-    log "Anonymous mode deactivated!"
+    log "Ghost mode DISABLED."
+    warn "Your real IP is now exposed."
 }
 
-check_status() {
-    log "Checking anonymous status..."
+############################
+# ROTATE CIRCUIT
+############################
 
-    echo -e "\n${BLUE}=== SYSTEM STATUS ===${NC}"
+rotate_tor() {
+    require_root
 
-    # Check Tor
-    if systemctl is-active --quiet tor; then
-        echo -e "Tor: ${GREEN}Running${NC}"
-    else
-        echo -e "Tor: ${RED}Stopped${NC}"
+    log "Requesting new Tor circuit..."
+
+    local ctrl_pass=""
+    [[ -f "$CONFIG_DIR/.ctrl_pass" ]] && \
+        ctrl_pass="$(cat "$CONFIG_DIR/.ctrl_pass")"
+
+    if [[ -z "$ctrl_pass" ]]; then
+        err "No control password found. Is Ghost Mode active?"
+        return 1
     fi
 
-    # Check Privoxy
-    if systemctl is-active --quiet privoxy; then
-        echo -e "Privoxy: ${GREEN}Running${NC}"
+    printf "AUTHENTICATE \"%s\"\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$ctrl_pass" \
+        | nc 127.0.0.1 "$TOR_CONTROL_PORT" >/dev/null 2>&1
+
+    # Tor requires 10s between NEWNYM signals
+    log "Waiting 10s for new circuit to establish..."
+    sleep 10
+
+    verify_tor_ip
+    log "Circuit rotated."
+}
+
+############################
+# STATUS
+############################
+
+status_ghost() {
+    echo
+    echo -e "${BLUE}=================================${NC}"
+    echo -e "${BLUE}        GHOST STATUS v3.0        ${NC}"
+    echo -e "${BLUE}=================================${NC}"
+    echo
+
+    echo -n "  Tor service  : "
+    systemctl is-active tor 2>/dev/null || echo "inactive"
+
+    echo -n "  SOCKS port   : "
+    nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null \
+        && echo "open ($TOR_PORT)" || echo "CLOSED"
+
+    echo -n "  Public IP    : "
+    torsocks curl -s --max-time 8 https://ipinfo.io/ip 2>/dev/null \
+        || echo "unavailable"
+    echo
+
+    echo -n "  Interface    : "
+    default_iface
+
+    echo -n "  MAC address  : "
+    cat /sys/class/net/"$(default_iface)"/address 2>/dev/null || echo "unknown"
+
+    echo -n "  IPv6 disabled: "
+    sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown"
+
+    echo -n "  DNS server   : "
+    grep "nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1
+
+    echo -n "  iptables     : "
+    local rules
+    rules="$(iptables -L OUTPUT --line-numbers 2>/dev/null | wc -l)"
+    echo "$rules rules active"
+
+    echo
+}
+
+############################
+# LEAK TEST
+############################
+
+leak_test() {
+    log "Running comprehensive leak test..."
+
+    echo
+    echo -e "${BLUE}===== TOR CHECK =====${NC}"
+    torsocks curl -s --max-time 10 https://check.torproject.org/api/ip 2>/dev/null \
+        | python3 -m json.tool 2>/dev/null || echo "unavailable"
+
+    echo
+    echo -e "${BLUE}===== PUBLIC IP =====${NC}"
+    torsocks curl -s --max-time 10 https://ipinfo.io 2>/dev/null \
+        | python3 -m json.tool 2>/dev/null || echo "unavailable"
+
+    echo
+    echo -e "${BLUE}===== DNS LEAK =====${NC}"
+    torsocks curl -s --max-time 10 "https://bash.ws/dnsleak/test/$RANDOM" 2>/dev/null \
+        | python3 -m json.tool 2>/dev/null || \
+        torsocks dig +short TXT whoami.cloudflare @1.1.1.1 2>/dev/null || \
+        echo "DNS test unavailable"
+
+    echo
+    echo -e "${BLUE}===== WEBRTC =====${NC}"
+    echo "  WebRTC cannot be tested from CLI."
+    echo "  Open: https://browserleaks.com/webrtc"
+
+    echo
+    echo -e "${BLUE}===== IPV6 LEAK =====${NC}"
+    if sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q "1"; then
+        echo "  IPv6 is disabled. No IPv6 leak possible."
     else
-        echo -e "Privoxy: ${RED}Stopped${NC}"
+        warn "  IPv6 is ENABLED. Risk of IPv6 leak!"
     fi
 
-    # Check MAC
-    echo -e "\n${BLUE}=== MAC ADDRESSES ===${NC}"
-    for iface in $(ls /sys/class/net/ | grep -v lo); do
-        mac=$(cat /sys/class/net/"$iface"/address 2>/dev/null)
-        echo -e "$iface: $mac"
+    echo
+}
+
+############################
+# MENU
+############################
+
+menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}=================================${NC}"
+        echo -e "${BLUE}         GHOST TOOLKIT v3.0      ${NC}"
+        echo -e "${BLUE}=================================${NC}"
+        echo
+        echo "  1. Enable Ghost Mode"
+        echo "  2. Disable Ghost Mode"
+        echo "  3. Rotate Tor Circuit"
+        echo "  4. Status"
+        echo "  5. Leak Test"
+        echo "  6. Exit"
+        echo
+
+        read -rp "Select [1-6]: " choice
+
+        case "$choice" in
+            1) start_ghost  ;;
+            2) stop_ghost   ;;
+            3) rotate_tor   ;;
+            4) status_ghost ;;
+            5) leak_test    ;;
+            6) exit 0       ;;
+            *) warn "Invalid option" ;;
+        esac
+
+        echo
+        read -rp "Press Enter to continue..."
     done
-
-    # Check IP
-    echo -e "\n${BLUE}=== PUBLIC IP ===${NC}"
-    timeout 10 curl --socks5-hostname 127.0.0.1:$TOR_PORT -s https://ipinfo.io/ip || echo "Cannot determine IP"
-
-    # Check DNS
-    echo -e "\n${BLUE}=== DNS LEAK TEST ===${NC}"
-    timeout 10 curl --socks5-hostname 127.0.0.1:$TOR_PORT -s https://dnsleaktest.com | grep -oP 'Your IP address:[^<]*' || echo "Test failed"
 }
 
-test_anonymity() {
-    log "Testing anonymity..."
+############################
+# MAIN
+############################
 
-    echo -e "\n${BLUE}=== TOR CHECK ===${NC}"
-    curl --socks5-hostname 127.0.0.1:$TOR_PORT -s https://check.torproject.org | grep -oP 'Congratulations.[^<]*' || echo "Not using Tor"
+mkdir -p "$(dirname "$LOG_FILE")" "$CONFIG_DIR"
 
-    echo -e "\n${BLUE}=== IP INFO ===${NC}"
-    curl --socks5-hostname 127.0.0.1:$TOR_PORT -s https://ipinfo.io | grep -E 'ip|city|country|org' | head -5
-
-    echo -e "\n${BLUE}=== PROXY TEST ===${NC}"
-    proxychains curl -s https://httpbin.org/ip | grep origin
-}
-
-enable_persistent() {
-    log "Enabling persistent anonymous mode..."
-
-    # Add to bashrc
-    echo '
-# Ghost Mode Aliases
-alias ghost-on="sudo systemctl start tor && sudo systemctl start privoxy && export http_proxy=http://127.0.0.1:8118 && export https_proxy=http://127.0.0.1:8118"
-alias ghost-off="sudo systemctl stop tor && sudo systemctl stop privoxy && unset http_proxy https_proxy"
-alias ghost-status="systemctl status tor; systemctl status privoxy; curl --socks5 127.0.0.1:9050 https://ipinfo.io/ip"
-' >> ~/.bashrc
-
-    # Create systemd service
-    cat > /etc/systemd/system/ghost-mode.service << EOF
-[Unit]
-Description=Ghost Anonymous Mode
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/ghost.sh on
-ExecStop=/usr/local/bin/ghost.sh off
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    log "Persistent mode enabled. Run: sudo systemctl enable ghost-mode"
-}
-
-# Main execution
-case "$1" in
-    "on"|"start"|"enable")
-        check_root
+case "${1:-}" in
+    install)
+        require_root
         install_deps
-        configure_proxychains
-        start_services
-        check_status
         ;;
-
-    "off"|"stop"|"disable")
-        check_root
-        stop_services
-        check_status
+    on|start)
+        start_ghost
         ;;
-
-    "status"|"check")
-        check_status
+    off|stop)
+        stop_ghost
         ;;
-
-    "test")
-        test_anonymity
+    rotate)
+        rotate_tor
         ;;
-
-    "persistent"|"auto")
-        enable_persistent
+    status)
+        status_ghost
         ;;
-
-    "install")
-        check_root
-        install_deps
-        configure_proxychains
-        cp "$0" /usr/local/bin/ghost
-        chmod +x /usr/local/bin/ghost
-        log "Installed to /usr/local/bin/ghost"
+    leak-test)
+        leak_test
         ;;
-
+    menu)
+        menu
+        ;;
     *)
-        echo -e "${BLUE}Ghost Anonymous Mode Switcher${NC}"
-        echo -e "${GREEN}Usage:${NC} sudo ./ghost.sh [command]"
         echo
-        echo "Commands:"
-        echo "  on/start     - Enable anonymous mode"
-        echo "  off/stop     - Disable anonymous mode"
-        echo "  status       - Check current status"
-        echo "  test         - Test anonymity"
-        echo "  install      - Install to system"
-        echo "  persistent   - Enable auto-start"
+        echo "Ghost Toolkit v3.0"
         echo
-        echo "Examples:"
-        echo "  sudo ./ghost.sh on"
-        echo "  sudo ./ghost.sh status"
-        echo "  sudo ./ghost.sh test"
-        exit 1
+        echo "Usage:"
+        echo "  sudo ghost install     Install dependencies"
+        echo "  sudo ghost on          Enable Ghost Mode"
+        echo "  sudo ghost off         Disable Ghost Mode"
+        echo "  sudo ghost rotate      Rotate Tor circuit"
+        echo "  sudo ghost status      Show current status"
+        echo "  sudo ghost leak-test   Run leak tests"
+        echo "  sudo ghost menu        Interactive menu"
+        echo
         ;;
 esac
-
-log "Operation completed. Log: $LOG_FILE"
