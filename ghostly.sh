@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ghostly.sh - Hardened Anonymous Networking Toolkit v2.0
+# ghostly.sh - Hardened Anonymous Networking Toolkit
 #
 
 set -Eeuo pipefail
@@ -342,10 +342,22 @@ configure_firewall() {
         -m owner --uid-owner "$TOR_USER" \
         -j ACCEPT
 
+    # Skip loopback — nf_tables requires negation immediately after the flag,
+    # so we use RETURN rules instead of ! -d / ! -m owner
     iptables -t nat -A OUTPUT \
         -p tcp --syn \
-        ! -d 127.0.0.0/8 \
-        ! -m owner --uid-owner "$TOR_USER" \
+        -d 127.0.0.0/8 \
+        -j RETURN
+
+    # Skip Tor daemon's own traffic
+    iptables -t nat -A OUTPUT \
+        -p tcp --syn \
+        -m owner --uid-owner "$TOR_USER" \
+        -j RETURN
+
+    # Redirect everything else through TransPort
+    iptables -t nat -A OUTPUT \
+        -p tcp --syn \
         -j REDIRECT --to-ports "$TOR_TRANS_PORT"
 
     iptables -t nat -A OUTPUT \
