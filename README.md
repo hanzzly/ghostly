@@ -1,6 +1,6 @@
 # 👻 Ghostly
 
-A production-grade hardened anonymity toolkit for Linux. Routes all traffic through [Tor](https://www.torproject.org/), spoofs your MAC address, disables IPv6, and applies a strict kill-switch firewall — with automatic rollback protection to prevent network lockout.
+A production-grade adaptive anonymity toolkit for Linux. Automatically detects your runtime environment and configures the optimal Tor anonymity strategy — full transparent routing on bare metal, SOCKS-only safe mode on WSL/containers, with automatic fallback and zero-lockout rollback protection.
 
 > ⚠️ **For legal and ethical use only.** Intended for privacy-conscious users, security researchers, journalists, and penetration testers working in authorized environments.
 
@@ -8,18 +8,19 @@ A production-grade hardened anonymity toolkit for Linux. Routes all traffic thro
 
 ## Features
 
-- 🔒 **Full traffic routing through Tor** — transparent proxy via iptables
-- 🛡️ **Kill-switch firewall** — OUTPUT DROP applied *only after* Tor is verified
-- 🔄 **Automatic rollback** — `trap ERR` restores everything on failure, no network lockout
-- 🎭 **Smart MAC spoofing** — auto-skipped on WSL, Docker, Hyper-V, KVM, VPS
-- 🚫 **IPv6 disable** — kernel-level, persists across hotplug events
-- 🔐 **DNS over Tor** — locked via `chattr +i`, DNS applied after Tor is confirmed
-- 🍪 **Cookie authentication** — no plaintext control passwords
-- 📁 **torrc.d snippet** — non-destructive Tor config at `/etc/tor/torrc.d/ghostly.conf`
-- 🌐 **LAN exclusions** — `192.168.x`, `10.x`, `172.16.x` excluded in balanced/safe mode
-- ⚙️ **Three modes** — `balanced`, `strict`, `safe`
-- 🩺 **Diagnostics** — virt type, network manager, firewall backend, bootstrap status
-- 🧪 **Leak test** — IP, DNS, IPv6, kill-switch check
+- 🧠 **Adaptive runtime profiles** — auto-detects baremetal, VM, cloud, WSL, container
+- 🔀 **Automatic routing mode selection** — transparent or SOCKS-only, based on environment
+- 🔄 **Transparent → SOCKS fallback** — if transparent mode fails, downgrades automatically
+- 🔒 **Full transparent Tor routing** — iptables-based on supported environments
+- 🛡️ **Kill-switch firewall** — OUTPUT DROP applied *only after* Tor verified
+- 🔐 **Startup verification chain** — service → SOCKS → bootstrap → IsTor=true
+- 🎭 **Smart MAC spoofing** — auto-skipped on WSL, Docker, Hyper-V, KVM, cloud
+- 🚫 **IPv6 disable** — kernel-level, skipped on cloud/container
+- 🔑 **Cookie authentication** — no plaintext passwords anywhere
+- 📁 **torrc.d snippet** — non-destructive Tor config
+- 🌐 **LAN exclusions** — `10.x`, `172.16.x`, `192.168.x` excluded in balanced/safe mode
+- 🩺 **Adaptive diagnostics** — profile capabilities, WSL warnings, bootstrap phase
+- ↩️ **Zero-lockout rollback** — `trap ERR` restores everything on any failure
 - 📋 **Timestamped logging** — `/var/log/ghostly.log`
 
 ---
@@ -40,7 +41,6 @@ cd ghostly
 chmod +x ghostly.sh
 sudo ln -s "$(pwd)/ghostly.sh" /usr/local/bin/ghostly
 
-# Install dependencies (tor, macchanger, iptables, nftables, etc.)
 sudo ghostly install
 ```
 
@@ -49,108 +49,156 @@ sudo ghostly install
 ## Usage
 
 ```bash
-sudo ghostly on                   # Enable (balanced mode)
-sudo ghostly on --mode strict     # Maximum privacy
-sudo ghostly on --mode safe       # Maximum stability
-sudo ghostly off                  # Disable & restore everything
-sudo ghostly rotate               # Rotate Tor circuit (new identity)
-sudo ghostly status               # Show current status
-sudo ghostly leak-test            # Run leak tests
-sudo ghostly diag                 # Environment diagnostics
-sudo ghostly menu                 # Interactive menu
-ghostly --version                 # Show version
+sudo ghostly on                      # Enable (auto-detect profile + mode)
+sudo ghostly on --mode strict        # Maximum privacy
+sudo ghostly on --mode safe          # Maximum stability
+sudo ghostly on --profile wsl        # Force a specific runtime profile
+sudo ghostly off                     # Disable & restore everything
+sudo ghostly rotate                  # Rotate Tor circuit (new identity)
+sudo ghostly status                  # Full status with profile info
+sudo ghostly leak-test               # Leak tests (routing-aware)
+sudo ghostly diag                    # Full environment diagnostics
+sudo ghostly menu                    # Interactive menu
+ghostly --version                    # Show version
 ```
 
 ---
 
-## Modes
+## Runtime Profiles
+
+Ghostly automatically selects the right profile. You can also force one with `--profile`.
+
+| Profile | Transparent | MAC Spoof | IPv6 Disable | DNS Lock | Kill-Switch |
+|---------|:-----------:|:---------:|:------------:|:--------:|:-----------:|
+| `baremetal` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `vm` | ✅ | ❌ | ✅ | ✅ | ✅ |
+| `cloud` | ✅ | ❌ | ❌ | ✅ | ✅ |
+| `wsl` | ❌ | ❌ | ✅ | ❌ | ❌ |
+| `container` | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+### WSL & Container: SOCKS-only mode
+
+On WSL and containers, Ghostly cannot modify kernel networking. Instead:
+
+```bash
+# Ghostly starts Tor and gives you SOCKS5 access:
+export https_proxy=socks5h://127.0.0.1:9050
+export http_proxy=socks5h://127.0.0.1:9050
+
+# curl direct:
+curl --socks5-hostname 127.0.0.1:9050 https://ipinfo.io/ip
+
+# proxychains:
+proxychains4 curl https://ipinfo.io/ip
+```
+
+---
+
+## Detection Logic
+
+```
+1. systemd-detect-virt           (primary — most reliable)
+2. /.dockerenv                   (Docker/Podman fallback)
+3. /proc/version grep microsoft  (WSL fallback)
+4. /proc/1/environ container=lxc (LXC fallback)
+5. /run/systemd/container        (systemd-nspawn)
+
+Detected virt string → canonical profile:
+  none / bare-metal  → baremetal
+  wsl / wsl2         → wsl
+  docker / podman    → container
+  lxc / openvz       → container
+  kvm / vmware / xen → vm
+  amazon / azure     → cloud
+```
+
+---
+
+## Privacy Modes
 
 | Mode | LAN Excluded | Circuits | StrictNodes | Use Case |
 |------|:---:|:---:|:---:|---------|
-| `balanced` | ✅ | 32 | No | Default — privacy + usability |
-| `strict` | ❌ | 8 | Yes | Maximum anonymity, all traffic via Tor |
+| `balanced` | ✅ | 32 | No | Default |
+| `strict` | ❌ | 8 | Yes | Maximum anonymity |
 | `safe` | ✅ | 64 | No | VM/unstable environments |
 
-Override mode at any time:
-```bash
-sudo ghostly on --mode strict
-# or set permanently:
-export GHOSTLY_MODE=strict
-```
+Modes combine with profiles. For example: `vm` + `strict` = transparent routing (kernel-level), no LAN exclusion, 8 circuits.
 
 ---
 
-## Startup Flow
+## Startup Verification Chain
 
-Safe ordering prevents network lockout — kill-switch is applied **last**, after Tor is verified:
+Ghostly runs 4 verification steps before activating the kill-switch:
 
 ```
-1. Backup routes & firewall
-2. Configure Tor         → write /etc/tor/torrc.d/ghostly.conf
-3. Start Tor             → systemctl restart tor
-4. Spoof MAC             → skipped automatically on VMs/containers
-5. Disable IPv6          → kernel sysctl + sysctl.d persist
-6. Apply firewall        → OUTPUT stays ACCEPT (permissive)
-7. Wait for bootstrap    → journalctl + control port check
-8. Verify Tor exit IP    → check.torproject.org/api/ip
-9. Lock DNS              → /etc/resolv.conf → 127.0.0.1, chattr +i
-10. Activate kill-switch → OUTPUT policy → DROP
+[1/4] Tor service active       → systemctl is-active tor
+[2/4] SOCKS port open          → nc -z 127.0.0.1:9050
+[3/4] Bootstrap 100%           → journalctl + control port GETINFO
+[4/4] IsTor=true               → check.torproject.org/api/ip
+         ↓ pass                        ↓ fail
+  Lock DNS → Kill-switch       Transparent → SOCKS fallback
+                                       ↓ also fail
+                                   Full rollback
 ```
+
+Kill-switch (`OUTPUT DROP`) is **never** applied before step 4 passes.
 
 ---
 
-## Automatic Rollback
+## Automatic Fallback
 
-If any step fails (Tor bootstrap timeout, config error, etc.), Ghostly automatically restores your original state:
+If transparent routing fails verification, Ghostly automatically downgrades:
 
 ```
-trap cleanup_on_error ERR
-  → OUTPUT ACCEPT (immediate, prevents lockout)
-  → restore iptables
-  → restore resolv.conf
-  → restore MAC
-  → re-enable IPv6
-  → restore routing table
-  → stop Tor
-  → remove torrc.d snippet
+transparent mode failed
+  → restore firewall (OUTPUT ACCEPT)
+  → reconfigure Tor without TransPort/DNSPort
+  → re-run verification chain in SOCKS-only mode
+  → if passes: continue in SOCKS fallback mode
+  → if fails: full rollback, exit cleanly
 ```
 
-No manual intervention needed — your internet connection survives a failed startup.
+Status will show `routing: socks-only (fallback)` when this occurs.
 
 ---
 
-## Virtualization Detection
+## Rollback Protection
 
-MAC spoofing is automatically skipped for:
+Every startup step is wrapped in `trap cleanup_on_error ERR`:
 
-| Environment | Detection Method |
-|------------|-----------------|
-| WSL / WSL2 | `/proc/version` kernel string |
-| Docker | `/.dockerenv` file |
-| LXC | `/proc/1/environ` container flag |
-| Hyper-V | `systemd-detect-virt` |
-| KVM / QEMU | `systemd-detect-virt` |
-| VMware | `systemd-detect-virt` |
-| AWS / GCP / Azure | `systemd-detect-virt` |
+```
+Any error →
+  OUTPUT ACCEPT  (immediate, prevents lockout)
+  restore iptables
+  restore resolv.conf
+  restore MAC address
+  re-enable IPv6
+  restore routing table
+  stop Tor
+  remove torrc.d snippet
+  clear state file
+```
+
+Your internet connection survives any failure.
 
 ---
 
-## Firewall Design
+## Tor Config (torrc.d)
 
-Kill-switch uses **RETURN-based exclusions** instead of `! -flag` negation, ensuring compatibility with both `iptables-legacy` and `iptables-nft` (nf_tables) backends:
+Ghostly writes a profile-aware snippet to `/etc/tor/torrc.d/ghostly.conf` and adds a `%include` to the main `torrc`. Your existing Tor config is never overwritten.
 
+**baremetal/vm/cloud snippet includes:**
 ```
-INPUT   → DROP (default)
-FORWARD → DROP (default)
-OUTPUT  → ACCEPT → DROP (after Tor verified)
+SocksPort, ControlPort, CookieAuthentication
+TransPort 9040 IsolateClientAddr IsolateClientProtocol
+DNSPort 5353
+VirtualAddrNetworkIPv4, AutomapHostsOnResolve
+```
 
-ALLOW   loopback
-ALLOW   established/related
-ALLOW   Tor daemon (by UID)
-RETURN  LAN ranges (balanced/safe mode)
-NAT     TCP  → TransPort 9040
-NAT     DNS  → DNSPort 5353
-DROP    fallthrough
+**wsl/container snippet includes:**
+```
+SocksPort, ControlPort, CookieAuthentication
+# (no TransPort, no DNSPort)
 ```
 
 ---
@@ -160,13 +208,13 @@ DROP    fallthrough
 | Path | Purpose |
 |------|---------|
 | `/etc/ghostly/` | Config directory |
-| `/etc/tor/torrc.d/ghostly.conf` | Tor config snippet (non-destructive) |
+| `/etc/tor/torrc.d/ghostly.conf` | Tor config snippet |
 | `/var/lib/ghostly/iptables.bak` | Firewall backup |
 | `/var/lib/ghostly/resolv.conf.bak` | DNS backup |
 | `/var/lib/ghostly/routes.bak` | Routing table backup |
 | `/var/lib/ghostly/state` | Active state file |
 | `/var/log/ghostly.log` | Timestamped activity log |
-| `/run/tor/control.authcookie` | Tor cookie auth (root-readable) |
+| `/run/tor/control.authcookie` | Tor cookie (root-readable) |
 | `/etc/sysctl.d/99-ghostly-no-ipv6.conf` | IPv6 disable persistence |
 
 ---
@@ -179,31 +227,22 @@ sudo ghostly diag
 
 Reports:
 
-- Virtualization type & MAC spoof eligibility
-- Active network manager (NetworkManager / systemd-networkd / ifupdown)
-- Firewall backend (iptables-legacy / iptables-nft / nftables)
-- Tor service status & bootstrap log
-- DNS configuration
-- IPv6 status
+- Runtime profile + capability matrix
+- WSL/container compatibility warnings
+- Tor service status + bootstrap phase (live from control port)
+- Active torrc.d snippet
 - Firewall OUTPUT chain rules
-
----
-
-## Security Notes
-
-- **Cookie auth**: Tor control port uses `CookieAuthentication 1` — no plaintext passwords stored anywhere.
-- **Non-destructive Tor config**: Ghostly writes to `/etc/tor/torrc.d/ghostly.conf` and adds a `%include` to the main `torrc`. Your existing Tor config is never overwritten.
-- **DNS timing**: `resolv.conf` is only locked *after* Tor bootstraps — avoids a scenario where DNS is broken before Tor is ready.
-- **Kill-switch timing**: `OUTPUT DROP` is applied *after* Tor exit is verified — prevents locking yourself out if Tor fails to start.
+- Network manager + firewall backend detection
+- DNS and IPv6 status
 
 ---
 
 ## Limitations
 
-- **WebRTC**: Cannot be blocked at the OS level. Check manually at [browserleaks.com/webrtc](https://browserleaks.com/webrtc) or use Tor Browser / uBlock Origin.
-- **UDP (non-DNS)**: Tor only carries TCP. Non-DNS UDP is blocked by the kill-switch (dropped, not leaked).
-- **Tor Browser**: For maximum browser anonymity, use [Tor Browser](https://www.torproject.org/download/) alongside Ghostly.
-- **Performance**: All traffic through Tor will be slower. Expected behavior.
+- **WebRTC**: Cannot be blocked at the OS level. Check at [browserleaks.com/webrtc](https://browserleaks.com/webrtc) or use Tor Browser.
+- **UDP (non-DNS)**: Tor only carries TCP. Non-DNS UDP is dropped by the kill-switch.
+- **WSL kill-switch**: Not possible in WSL — use SOCKS5 proxy per-application.
+- **Performance**: Traffic through Tor will be slower. Expected behavior.
 
 ---
 
