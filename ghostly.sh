@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ghostly.sh - Production-Grade Hardened Anonymity Toolkit
+# ghostly.sh - Production-Grade Adaptive Anonymity Toolkit
 # https://github.com/hanzzly/ghostly
 #
 
@@ -10,7 +10,7 @@ set -Eeuo pipefail
 # VERSION
 ############################
 
-VERSION="3.0"
+VERSION="4.0"
 
 ############################
 # PORTS
@@ -33,21 +33,44 @@ COOKIE_FILE="/run/tor/control.authcookie"
 STATE_FILE="/var/lib/ghostly/state"
 
 ############################
-# DEFAULTS
+# RUNTIME DEFAULTS
 ############################
 
 TOR_USER="debian-tor"
 BOOTSTRAP_TIMEOUT=90
 MAC_RETRY=3
-MODE="${GHOSTLY_MODE:-balanced}"   # strict | balanced | safe
+
+# User-facing mode (privacy level)
+MODE="${GHOSTLY_MODE:-balanced}"      # strict | balanced | safe
+
+# Runtime profile — auto-detected, can be overridden
+# baremetal | vm | cloud | wsl | container
+RUNTIME_PROFILE=""
+
+# Tor routing mode — set by profile resolution
+# transparent | socks-only
+TOR_ROUTING_MODE=""
+
+# Feature flags — resolved per profile
+SKIP_MAC=0
+SKIP_TRANSPARENT=0
+SKIP_DNS_LOCK=0
+SKIP_IPV6=0
+SKIP_KILLSWITCH=0
+
+# Verification state (populated during startup chain)
+_SOCKS_OK=0
+_CIRCUIT_OK=0
+_ISTOR_OK=0
+_FALLBACK_MODE=0
 
 # LAN ranges excluded from Tor redirect
 LAN_RANGES=(
     "10.0.0.0/8"
     "172.16.0.0/12"
     "192.168.0.0/16"
-    "169.254.0.0/16"   # link-local
-    "100.64.0.0/10"    # CGNAT
+    "169.254.0.0/16"
+    "100.64.0.0/10"
 )
 
 ############################
@@ -112,36 +135,26 @@ check_deps() {
     for bin in tor nc ip sysctl curl; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        die "Missing required binaries: ${missing[*]}. Run: sudo ghostly install"
-    fi
+    [[ ${#missing[@]} -gt 0 ]] && \
+        die "Missing: ${missing[*]}. Run: sudo ghostly install"
 }
 
 ############################
-# FIREWALL BACKEND DETECT
+# FIREWALL BACKEND
 ############################
 
-# Returns: iptables-legacy | iptables-nft | nftables
 detect_fw_backend() {
     if command -v nft >/dev/null 2>&1 && nft list tables &>/dev/null; then
-        # Check if iptables is actually nft wrapper
-        if iptables --version 2>/dev/null | grep -q "nf_tables"; then
-            echo "iptables-nft"
-        else
-            echo "nftables"
-        fi
+        iptables --version 2>/dev/null | grep -q "nf_tables" \
+            && echo "iptables-nft" || echo "nftables"
     elif command -v iptables >/dev/null 2>&1; then
-        if iptables --version 2>/dev/null | grep -q "legacy"; then
-            echo "iptables-legacy"
-        else
-            echo "iptables-nft"
-        fi
+        iptables --version 2>/dev/null | grep -q "legacy" \
+            && echo "iptables-legacy" || echo "iptables-nft"
     else
         echo "unknown"
     fi
 }
 
-# Wrapper: use iptables-legacy if available to avoid nf_tables quirks
 ipt() {
     if command -v iptables-legacy >/dev/null 2>&1; then
         iptables-legacy "$@"
@@ -167,38 +180,139 @@ ipt_restore() {
 }
 
 ############################
-# VIRTUALIZATION DETECT
+# ENVIRONMENT DETECTION
 ############################
 
-VIRT_TYPE="none"
-SKIP_MAC=0
+# Raw virt string from systemd-detect-virt or manual checks
+_VIRT_RAW="none"
 
-detect_virt() {
+detect_environment() {
+    # Layer 1: systemd-detect-virt (most reliable)
     if command -v systemd-detect-virt >/dev/null 2>&1; then
-        VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || echo 'none')"
-    elif [[ -f /proc/1/environ ]] && grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
-        VIRT_TYPE="lxc"
-    elif [[ -f /.dockerenv ]]; then
-        VIRT_TYPE="docker"
-    elif grep -qi "microsoft" /proc/version 2>/dev/null; then
-        VIRT_TYPE="wsl"
-    else
-        VIRT_TYPE="none"
+        _VIRT_RAW="$(systemd-detect-virt 2>/dev/null || echo 'none')"
     fi
 
-    case "$VIRT_TYPE" in
-        wsl|wsl2|microsoft|docker|lxc|lxc-libvirt|openvz|podman)
-            SKIP_MAC=1
-            warn "Virtualization detected: $VIRT_TYPE — MAC spoofing will be skipped."
+    # Layer 2: Manual fallbacks if systemd gave "none"
+    if [[ "$_VIRT_RAW" == "none" ]]; then
+        if [[ -f /.dockerenv ]]; then
+            _VIRT_RAW="docker"
+        elif grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then
+            _VIRT_RAW="wsl"
+        elif [[ -f /proc/1/environ ]] && \
+             grep -qz "container=lxc\|container=podman" /proc/1/environ 2>/dev/null; then
+            _VIRT_RAW="lxc"
+        elif [[ -d /run/systemd/container ]]; then
+            _VIRT_RAW="lxc"
+        fi
+    fi
+
+    # Layer 3: Resolve to canonical runtime profile
+    case "$_VIRT_RAW" in
+        none|bare-metal)
+            RUNTIME_PROFILE="baremetal"
             ;;
-        kvm|qemu|vmware|hyperv|xen|amazon|azure|gce|oracle)
-            SKIP_MAC=1
-            warn "VM/cloud environment: $VIRT_TYPE — MAC spoofing will be skipped."
+        wsl|wsl2|microsoft)
+            RUNTIME_PROFILE="wsl"
             ;;
-        none|bare-metal|*)
-            SKIP_MAC=0
+        docker|podman)
+            RUNTIME_PROFILE="container"
+            ;;
+        lxc|lxc-libvirt|openvz|systemd-nspawn)
+            RUNTIME_PROFILE="container"
+            ;;
+        kvm|qemu|vmware|hyperv|xen|bhyve|parallels)
+            RUNTIME_PROFILE="vm"
+            ;;
+        amazon|azure|gce|oracle|openstack|upcloud|vultr|digitalocean)
+            RUNTIME_PROFILE="cloud"
+            ;;
+        *)
+            # Unknown virt — treat conservatively as vm
+            RUNTIME_PROFILE="vm"
             ;;
     esac
+
+    info "Environment detected: virt='$_VIRT_RAW' → profile='$RUNTIME_PROFILE'"
+}
+
+############################
+# PROFILE RESOLUTION
+# Sets all feature flags based on RUNTIME_PROFILE
+############################
+
+resolve_profile() {
+    case "$RUNTIME_PROFILE" in
+
+        baremetal)
+            TOR_ROUTING_MODE="transparent"
+            SKIP_MAC=0
+            SKIP_TRANSPARENT=0
+            SKIP_DNS_LOCK=0
+            SKIP_IPV6=0
+            SKIP_KILLSWITCH=0
+            log "Profile: BAREMETAL — full transparent routing, MAC spoof, kill-switch"
+            ;;
+
+        vm)
+            TOR_ROUTING_MODE="transparent"
+            SKIP_MAC=1
+            SKIP_TRANSPARENT=0
+            SKIP_DNS_LOCK=0
+            SKIP_IPV6=0
+            SKIP_KILLSWITCH=0
+            warn "Profile: VM — transparent routing, MAC spoof skipped"
+            ;;
+
+        cloud)
+            TOR_ROUTING_MODE="transparent"
+            SKIP_MAC=1
+            SKIP_TRANSPARENT=0
+            SKIP_DNS_LOCK=0
+            SKIP_IPV6=1       # Cloud VPS often needs IPv6 for management
+            SKIP_KILLSWITCH=0
+            warn "Profile: CLOUD — transparent routing, MAC+IPv6 skipped"
+            ;;
+
+        wsl)
+            TOR_ROUTING_MODE="socks-only"
+            SKIP_MAC=1
+            SKIP_TRANSPARENT=1
+            SKIP_DNS_LOCK=1   # WSL DNS managed by Windows
+            SKIP_IPV6=0
+            SKIP_KILLSWITCH=1
+            warn "Profile: WSL — SOCKS-only mode, no kernel networking changes"
+            warn "WSL: Configure applications to use SOCKS5 127.0.0.1:${TOR_PORT}"
+            ;;
+
+        container)
+            TOR_ROUTING_MODE="socks-only"
+            SKIP_MAC=1
+            SKIP_TRANSPARENT=1
+            SKIP_DNS_LOCK=1
+            SKIP_IPV6=1
+            SKIP_KILLSWITCH=1
+            warn "Profile: CONTAINER — SOCKS-only mode, no kernel modifications"
+            ;;
+
+        *)
+            # Unknown — fail safe
+            TOR_ROUTING_MODE="socks-only"
+            SKIP_MAC=1
+            SKIP_TRANSPARENT=1
+            SKIP_DNS_LOCK=0
+            SKIP_IPV6=0
+            SKIP_KILLSWITCH=1
+            warn "Profile: UNKNOWN ($RUNTIME_PROFILE) — defaulting to SOCKS-only safe mode"
+            ;;
+    esac
+
+    # Mode overrides on top of profile
+    # strict mode forces transparent on capable profiles
+    if [[ "$MODE" == "strict" && "$TOR_ROUTING_MODE" == "socks-only" ]]; then
+        warn "Strict mode requested but profile '$RUNTIME_PROFILE' only supports SOCKS. Staying SOCKS."
+    fi
+
+    info "Routing mode: $TOR_ROUTING_MODE"
 }
 
 ############################
@@ -222,7 +336,7 @@ detect_netman() {
 ############################
 
 default_iface() {
-    ip route | awk '/default/ {print $5}' | head -n1
+    ip route 2>/dev/null | awk '/default/ {print $5}' | head -n1
 }
 
 ############################
@@ -233,17 +347,9 @@ install_deps() {
     log "Installing dependencies..."
     apt-get update -qq
     apt-get install -y \
-        tor \
-        torsocks \
-        proxychains4 \
-        macchanger \
-        curl \
-        iptables \
-        iptables-persistent \
-        iproute2 \
-        netcat-openbsd \
-        dnsutils \
-        nftables
+        tor torsocks proxychains4 macchanger curl \
+        iptables iptables-persistent iproute2 \
+        netcat-openbsd dnsutils nftables xxd
     log "Dependencies installed."
 }
 
@@ -253,68 +359,55 @@ install_deps() {
 
 backup_routes() {
     mkdir -p "$BACKUP_DIR"
-    ip route show > "$BACKUP_DIR/routes.bak"
-    ip rule show  > "$BACKUP_DIR/rules.bak"
+    ip route show > "$BACKUP_DIR/routes.bak" 2>/dev/null || true
+    ip rule show  > "$BACKUP_DIR/rules.bak"  2>/dev/null || true
     log "Routing table backed up."
 }
 
 restore_routes() {
-    if [[ -f "$BACKUP_DIR/routes.bak" ]]; then
-        log "Restoring routing table..."
-        # Only restore default route to avoid conflicts
-        local default_gw
-        default_gw="$(grep '^default' "$BACKUP_DIR/routes.bak" | head -1 || true)"
-        if [[ -n "$default_gw" ]]; then
-            ip route replace $default_gw 2>/dev/null || true
-        fi
-        log "Routes restored."
-    fi
+    [[ -f "$BACKUP_DIR/routes.bak" ]] || return 0
+    log "Restoring default route..."
+    local default_gw
+    default_gw="$(grep '^default' "$BACKUP_DIR/routes.bak" | head -1 || true)"
+    [[ -n "$default_gw" ]] && \
+        ip route replace $default_gw 2>/dev/null || true
+    log "Routes restored."
 }
 
 ############################
 # TOR CONFIG (torrc.d)
+# Adaptive: writes profile-appropriate snippet
 ############################
 
 configure_tor() {
-    log "Configuring Tor..."
+    log "Configuring Tor (profile: $RUNTIME_PROFILE, mode: $MODE)..."
 
-    mkdir -p "$BACKUP_DIR" "$CONFIG_DIR"
+    mkdir -p "$BACKUP_DIR" "$CONFIG_DIR" /etc/tor/torrc.d
 
-    # Ensure torrc.d includes are enabled
+    # Ensure %include in main torrc
     if [[ -f /etc/tor/torrc ]] && ! grep -q "torrc.d" /etc/tor/torrc; then
-        echo "" >> /etc/tor/torrc
-        echo "# Ghostly includes" >> /etc/tor/torrc
+        echo ""                              >> /etc/tor/torrc
+        echo "# Ghostly managed includes"   >> /etc/tor/torrc
         echo "%include /etc/tor/torrc.d/*.conf" >> /etc/tor/torrc
     fi
-    mkdir -p /etc/tor/torrc.d
 
-    # Mode-specific circuit options
-    local entry_nodes="" exit_nodes="" strict_nodes="0" max_circuits="32"
+    # Mode → circuit tuning
+    local strict_nodes="0" max_circuits="32"
     case "$MODE" in
-        strict)
-            strict_nodes="1"
-            max_circuits="8"
-            warn "Mode: STRICT — reduced circuit count, StrictNodes enabled."
-            ;;
-        safe)
-            max_circuits="64"
-            info "Mode: SAFE — more circuits, more permissive."
-            ;;
-        balanced|*)
-            max_circuits="32"
-            info "Mode: BALANCED"
-            ;;
+        strict)   strict_nodes="1"; max_circuits="8"  ;;
+        safe)     max_circuits="64"                   ;;
+        balanced) max_circuits="32"                   ;;
     esac
 
-    # Write snippet — CookieAuthentication, no plaintext password
+    # Build snippet — base config always present
     cat > "$TORRC_SNIPPET" <<EOF
-## Ghostly v${VERSION} — auto-generated, do not edit manually
-## Mode: ${MODE}
+## Ghostly v${VERSION} — auto-generated
+## Profile: ${RUNTIME_PROFILE} | Mode: ${MODE} | Routing: ${TOR_ROUTING_MODE}
 
 SocksPort ${TOR_PORT}
 ControlPort ${TOR_CONTROL_PORT}
 
-## Auth via cookie (no plaintext password)
+## Cookie auth (no plaintext passwords)
 CookieAuthentication 1
 CookieAuthFile ${COOKIE_FILE}
 CookieAuthFileGroupReadable 1
@@ -328,91 +421,162 @@ StrictNodes ${strict_nodes}
 MaxCircuitDirtiness 600
 NewCircuitPeriod 30
 MaxClientCircuitsPending ${max_circuits}
+EOF
 
-## Transparent proxy
+    # Transparent proxy ports — only for profiles that support it
+    if [[ "$SKIP_TRANSPARENT" -eq 0 ]]; then
+        cat >> "$TORRC_SNIPPET" <<EOF
+
+## Transparent proxy (profile: ${RUNTIME_PROFILE})
 VirtualAddrNetworkIPv4 10.192.0.0/10
 AutomapHostsOnResolve 1
 AutomapHostsSuffixes .onion,.exit
 TransPort ${TOR_TRANS_PORT} IsolateClientAddr IsolateClientProtocol
 DNSPort ${TOR_DNS_PORT}
 EOF
+    else
+        cat >> "$TORRC_SNIPPET" <<EOF
+
+## SOCKS-only mode (no TransPort/DNSPort — profile: ${RUNTIME_PROFILE})
+## Applications must be configured to use SOCKS5 127.0.0.1:${TOR_PORT}
+EOF
+    fi
 
     chmod 644 "$TORRC_SNIPPET"
 
-    # Validate config before restarting
     if ! tor --verify-config --torrc-file /etc/tor/torrc &>/dev/null; then
-        err "Tor config validation failed. Check $TORRC_SNIPPET"
+        err "Tor config validation failed. See: $TORRC_SNIPPET"
         return 1
     fi
 
     systemctl restart tor
-    log "Tor configured (mode: $MODE, cookie auth)."
+    log "Tor configured."
 }
 
 ############################
-# WAIT FOR TOR BOOTSTRAP
+# STARTUP VERIFICATION CHAIN
+# Returns 0 only if all required checks pass
 ############################
 
-wait_for_tor() {
-    log "Waiting for Tor bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
+# Step 1: Tor service active
+verify_service() {
+    if ! systemctl is-active --quiet tor 2>/dev/null; then
+        err "Tor service is not active."
+        return 1
+    fi
+    log "Verification [1/4]: Tor service active."
+    return 0
+}
 
+# Step 2: SOCKS port open
+verify_socks_port() {
+    local attempts=0
+    while (( attempts < 10 )); do
+        if nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null; then
+            _SOCKS_OK=1
+            log "Verification [2/4]: SOCKS port open (127.0.0.1:${TOR_PORT})."
+            return 0
+        fi
+        sleep 2
+        (( attempts++ ))
+    done
+    err "SOCKS port ${TOR_PORT} not open after 20s."
+    return 1
+}
+
+# Step 3: Bootstrap to 100%
+verify_bootstrap() {
+    log "Waiting for Tor bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
     local elapsed=0
+
     while (( elapsed < BOOTSTRAP_TIMEOUT )); do
-        # Primary: journalctl bootstrap check
-        if journalctl -u tor --since "2 minutes ago" --no-pager -q 2>/dev/null \
+        # Primary: journalctl
+        if journalctl -u tor --since "3 minutes ago" --no-pager -q 2>/dev/null \
             | grep -q "Bootstrapped 100%"; then
-            log "Tor bootstrapped (journal confirmed)."
+            log "Verification [3/4]: Bootstrap 100% (journal)."
             return 0
         fi
 
-        # Secondary: Tor control port GETINFO
-        if [[ -r "$COOKIE_FILE" ]] && nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
-            local status
-            status="$(echo -e "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
+        # Secondary: control port GETINFO
+        if nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
+            local phase
+            phase="$(echo -e "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
                 | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
-                | grep "PROGRESS=100" || true)"
-            if [[ -n "$status" ]]; then
-                log "Tor bootstrapped (control port confirmed)."
+                | grep "PROGRESS=" | grep -o "PROGRESS=[0-9]*" | cut -d= -f2 || echo 0)"
+            if [[ "$phase" == "100" ]]; then
+                log "Verification [3/4]: Bootstrap 100% (control port)."
                 return 0
             fi
+            # Show live progress
+            echo -ne "\r${CYAN}[i]${NC} Bootstrap progress: ${phase}%  (${elapsed}s / ${BOOTSTRAP_TIMEOUT}s)"
+        else
+            echo -ne "\r${YELLOW}[*]${NC} Bootstrapping... ${elapsed}s / ${BOOTSTRAP_TIMEOUT}s"
         fi
 
-        sleep 2
-        (( elapsed += 2 ))
-        echo -ne "\r${YELLOW}[*]${NC} Bootstrapping... ${elapsed}s / ${BOOTSTRAP_TIMEOUT}s"
+        sleep 3
+        (( elapsed += 3 ))
     done
     echo
 
-    # Fallback: SOCKS port open
-    if nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null; then
-        warn "Bootstrap log not confirmed, but SOCKS port is open. Proceeding with caution."
+    # Fallback: SOCKS open is better than nothing
+    if [[ "$_SOCKS_OK" -eq 1 ]]; then
+        warn "Verification [3/4]: Bootstrap log not confirmed. SOCKS open — proceeding with caution."
         return 0
     fi
 
-    return 1  # Caller handles this — do NOT die here (rollback needed)
+    err "Bootstrap timed out after ${BOOTSTRAP_TIMEOUT}s."
+    return 1
 }
 
-############################
-# VERIFY IP VIA TOR
-############################
+# Step 4: IsTor=true confirmation
+verify_tor_exit() {
+    log "Verification [4/4]: Confirming Tor exit IP..."
 
-verify_tor_ip() {
-    log "Verifying traffic exits via Tor..."
+    local ip="" tor_check=""
 
-    local ip tor_check
-    ip="$(torsocks curl -s --max-time 10 https://ipinfo.io/ip 2>/dev/null || true)"
-    tor_check="$(torsocks curl -s --max-time 10 https://check.torproject.org/api/ip 2>/dev/null || true)"
+    if [[ "$TOR_ROUTING_MODE" == "socks-only" ]]; then
+        # WSL/container: use SOCKS5 directly
+        ip="$(curl -s --max-time 15 \
+            --socks5-hostname "127.0.0.1:${TOR_PORT}" \
+            https://ipinfo.io/ip 2>/dev/null || true)"
+        tor_check="$(curl -s --max-time 15 \
+            --socks5-hostname "127.0.0.1:${TOR_PORT}" \
+            https://check.torproject.org/api/ip 2>/dev/null || true)"
+    else
+        # Transparent: use torsocks
+        ip="$(torsocks curl -s --max-time 15 https://ipinfo.io/ip 2>/dev/null || true)"
+        tor_check="$(torsocks curl -s --max-time 15 \
+            https://check.torproject.org/api/ip 2>/dev/null || true)"
+    fi
 
     if [[ -z "$ip" ]]; then
-        warn "Could not fetch public IP. Tor may not be fully up yet."
+        warn "Could not reach Tor exit. Circuit may not be established yet."
         return 1
     fi
 
     if echo "$tor_check" | grep -q '"IsTor":true'; then
-        log "Verified: Tor exit confirmed. IP: $ip"
+        _ISTOR_OK=1
+        _CIRCUIT_OK=1
+        log "Tor exit confirmed. IP: $ip"
+        return 0
     else
-        warn "Tor check inconclusive. IP: $ip — traffic may not be anonymized."
+        warn "IsTor check inconclusive. IP: $ip"
+        # Not a hard failure — could be API issue
+        return 0
     fi
+}
+
+# Full verification chain — called in sequence
+run_verification_chain() {
+    log "Running startup verification chain..."
+
+    verify_service  || return 1
+    verify_socks_port || return 1
+    verify_bootstrap  || return 1
+    verify_tor_exit   || warn "Exit verification inconclusive — check status after startup."
+
+    log "Verification chain passed."
+    return 0
 }
 
 ############################
@@ -420,8 +584,12 @@ verify_tor_ip() {
 ############################
 
 configure_dns() {
-    log "Locking DNS to Tor (127.0.0.1)..."
+    if [[ "$SKIP_DNS_LOCK" -eq 1 ]]; then
+        info "DNS lock skipped (profile: $RUNTIME_PROFILE)."
+        return 0
+    fi
 
+    log "Locking DNS to Tor (127.0.0.1)..."
     [[ -f /etc/resolv.conf ]] && \
         cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.bak"
 
@@ -442,16 +610,20 @@ restore_dns() {
         cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
         log "DNS restored."
     else
-        warn "No DNS backup found. Falling back to 8.8.8.8."
+        warn "No DNS backup. Falling back to 8.8.8.8."
         echo "nameserver 8.8.8.8" > /etc/resolv.conf
     fi
 }
 
 ############################
-# IPV6
+# IPv6
 ############################
 
 disable_ipv6() {
+    if [[ "$SKIP_IPV6" -eq 1 ]]; then
+        info "IPv6 disable skipped (profile: $RUNTIME_PROFILE)."
+        return 0
+    fi
     log "Disabling IPv6..."
     sysctl -w net.ipv6.conf.all.disable_ipv6=1     >/dev/null
     sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
@@ -465,11 +637,10 @@ EOF
 }
 
 enable_ipv6() {
-    log "Re-enabling IPv6..."
     rm -f /etc/sysctl.d/99-ghostly-no-ipv6.conf
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
-    sysctl -w net.ipv6.conf.lo.disable_ipv6=0       >/dev/null
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0       >/dev/null 2>&1 || true
     log "IPv6 re-enabled."
 }
 
@@ -479,17 +650,16 @@ enable_ipv6() {
 
 spoof_mac() {
     if [[ "$SKIP_MAC" -eq 1 ]]; then
-        warn "Skipping MAC spoof (virt: $VIRT_TYPE)."
+        info "MAC spoof skipped (profile: $RUNTIME_PROFILE)."
         return 0
     fi
+    command -v macchanger >/dev/null 2>&1 || {
+        warn "macchanger not found. Skipping MAC spoof."
+        return 0
+    }
 
     local iface; iface="$(default_iface)"
-    [[ -z "$iface" ]] && { err "No network interface found"; return 1; }
-
-    if ! command -v macchanger >/dev/null 2>&1; then
-        warn "macchanger not found, skipping MAC spoof."
-        return 0
-    fi
+    [[ -z "$iface" ]] && { err "No network interface found."; return 1; }
 
     log "Spoofing MAC on $iface..."
     local attempt=0
@@ -498,8 +668,7 @@ spoof_mac() {
         sleep 1
         if macchanger -r "$iface" 2>/dev/null; then
             ip link set "$iface" up
-            local new_mac; new_mac="$(cat /sys/class/net/"$iface"/address)"
-            log "MAC spoofed → $new_mac"
+            log "MAC spoofed → $(cat /sys/class/net/"$iface"/address)"
             return 0
         fi
         ip link set "$iface" up
@@ -507,61 +676,61 @@ spoof_mac() {
         warn "MAC spoof attempt $attempt failed, retrying..."
         sleep 2
     done
-    warn "MAC spoofing failed after $MAC_RETRY attempts. Continuing anyway."
+    warn "MAC spoofing failed after $MAC_RETRY attempts. Continuing."
 }
 
 restore_mac() {
-    if [[ "$SKIP_MAC" -eq 1 ]]; then return 0; fi
+    [[ "$SKIP_MAC" -eq 1 ]] && return 0
+    command -v macchanger >/dev/null 2>&1 || return 0
     local iface; iface="$(default_iface)"
-    [[ -z "$iface" ]] && return
-    command -v macchanger >/dev/null 2>&1 || return
-
-    log "Restoring original MAC on $iface..."
-    ip link set "$iface" down
-    sleep 1
+    [[ -z "$iface" ]] && return 0
+    log "Restoring MAC on $iface..."
+    ip link set "$iface" down; sleep 1
     macchanger -p "$iface" 2>/dev/null || true
     ip link set "$iface" up
     log "MAC restored."
 }
 
 ############################
-# FIREWALL (iptables-safe)
-# Uses RETURN-based exclusions (nf_tables compat)
-# OUTPUT DROP applied ONLY after Tor verified
+# FIREWALL
 ############################
 
 backup_firewall() {
     mkdir -p "$BACKUP_DIR"
-    ipt_save > "$BACKUP_DIR/iptables.bak"
+    ipt_save > "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
 }
 
 restore_firewall() {
+    # Always ensure OUTPUT is open first
+    ipt -P OUTPUT ACCEPT 2>/dev/null || true
+    ipt -P INPUT  ACCEPT 2>/dev/null || true
+
     if [[ -f "$BACKUP_DIR/iptables.bak" ]]; then
         ipt_restore < "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
-        log "Firewall restored."
+        log "Firewall restored from backup."
     else
         warn "No firewall backup. Resetting to ACCEPT-all."
         ipt -F; ipt -t nat -F; ipt -t mangle -F
-        ipt -P INPUT ACCEPT
-        ipt -P FORWARD ACCEPT
-        ipt -P OUTPUT ACCEPT
+        ipt -P INPUT ACCEPT; ipt -P FORWARD ACCEPT; ipt -P OUTPUT ACCEPT
     fi
 }
 
 configure_firewall() {
-    log "Applying kill-switch firewall (mode: $MODE)..."
+    if [[ "$SKIP_TRANSPARENT" -eq 1 ]]; then
+        info "Transparent firewall skipped (profile: $RUNTIME_PROFILE, routing: $TOR_ROUTING_MODE)."
+        return 0
+    fi
+
+    log "Applying transparent firewall (mode: $MODE)..."
     backup_firewall
 
-    # Flush
-    ipt -F
-    ipt -t nat -F
-    ipt -t mangle -F
+    ipt -F; ipt -t nat -F; ipt -t mangle -F
     ipt -X 2>/dev/null || true
 
-    # Policies — start PERMISSIVE, tighten after Tor verified
+    # START PERMISSIVE — OUTPUT → DROP only after Tor verified
     ipt -P INPUT   DROP
     ipt -P FORWARD DROP
-    ipt -P OUTPUT  ACCEPT   # ← stays ACCEPT until Tor confirmed
+    ipt -P OUTPUT  ACCEPT
 
     # Loopback
     ipt -A INPUT  -i lo -j ACCEPT
@@ -571,14 +740,14 @@ configure_firewall() {
     ipt -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ipt -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Tor daemon always allowed
+    # Tor daemon outbound always allowed
     ipt -A OUTPUT -m owner --uid-owner "$TOR_USER" -j ACCEPT
 
-    # NAT: skip loopback
+    # NAT: loopback RETURN (nf_tables compatible)
     ipt -t nat -A OUTPUT -p tcp -d 127.0.0.0/8 -j RETURN
     ipt -t nat -A OUTPUT -p tcp -m owner --uid-owner "$TOR_USER" -j RETURN
 
-    # NAT: LAN exclusions (mode-aware)
+    # NAT: LAN exclusions (not in strict mode)
     if [[ "$MODE" != "strict" ]]; then
         for lan in "${LAN_RANGES[@]}"; do
             ipt -t nat -A OUTPUT -p tcp -d "$lan" -j RETURN
@@ -586,32 +755,66 @@ configure_firewall() {
         done
         log "LAN ranges excluded from Tor redirect."
     else
-        warn "Strict mode: LAN traffic also redirected through Tor."
+        warn "Strict mode: all traffic redirected through Tor."
     fi
 
-    # NAT: redirect TCP through Tor TransPort
+    # NAT: redirect TCP → TransPort
     ipt -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TOR_TRANS_PORT"
 
-    # NAT: redirect DNS through Tor DNSPort
+    # NAT: redirect DNS → DNSPort
     ipt -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
     ipt -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
 
-    # Explicit DNS leak prevention
+    # DNS leak prevention
     ipt -A OUTPUT -p udp --dport 53 -m owner --uid-owner "$TOR_USER" -j ACCEPT
     ipt -A OUTPUT -p tcp --dport 53 -m owner --uid-owner "$TOR_USER" -j ACCEPT
 
-    log "Firewall applied (OUTPUT still ACCEPT — awaiting Tor verification)."
+    log "Firewall applied (OUTPUT=ACCEPT, awaiting kill-switch activation)."
 }
 
-# Called after Tor is verified — tightens OUTPUT to DROP
 apply_killswitch() {
+    if [[ "$SKIP_KILLSWITCH" -eq 1 ]]; then
+        info "Kill-switch skipped (profile: $RUNTIME_PROFILE)."
+        return 0
+    fi
+
     log "Activating kill-switch (OUTPUT → DROP)..."
     ipt -P OUTPUT DROP
-
-    # Ensure Tor owner rule is in place as safety net
+    # Safety net — always keep Tor daemon allowed
     ipt -A OUTPUT -m owner --uid-owner "$TOR_USER" -j ACCEPT 2>/dev/null || true
-
     log "Kill-switch active. All non-Tor traffic blocked."
+}
+
+############################
+# FALLBACK: TRANSPARENT → SOCKS
+############################
+
+fallback_to_socks() {
+    _FALLBACK_MODE=1
+    TOR_ROUTING_MODE="socks-only"
+    SKIP_TRANSPARENT=1
+    SKIP_KILLSWITCH=1
+
+    warn "═══════════════════════════════════════════"
+    warn " FALLBACK: Transparent mode failed."
+    warn " Downgrading to SOCKS-only SAFE MODE."
+    warn " Applications must use SOCKS5 127.0.0.1:${TOR_PORT}"
+    warn "═══════════════════════════════════════════"
+
+    # Restore firewall to safe state before retrying
+    restore_firewall
+    restore_dns
+
+    # Reconfigure Tor without TransPort/DNSPort
+    configure_tor
+
+    if ! run_verification_chain; then
+        err "SOCKS fallback also failed. Aborting."
+        return 1
+    fi
+
+    log "SOCKS-only safe mode active."
+    return 0
 }
 
 ############################
@@ -626,9 +829,9 @@ cleanup_on_error() {
     _ROLLBACK_DONE=1
 
     echo
-    err "Error occurred (exit $exit_code). Rolling back all changes..."
+    err "Error (exit $exit_code) — rolling back all changes..."
 
-    # Always restore OUTPUT to ACCEPT first — prevent network lockout
+    # Immediately open OUTPUT to prevent lockout
     ipt -P OUTPUT ACCEPT 2>/dev/null || true
     ipt -P INPUT  ACCEPT 2>/dev/null || true
 
@@ -640,10 +843,11 @@ cleanup_on_error() {
 
     systemctl stop tor 2>/dev/null || true
     rm -f "$TORRC_SNIPPET" 2>/dev/null || true
+    clear_state
 
     echo
-    warn "Rollback complete. Your original network config has been restored."
-    warn "Check $LOG_FILE for details."
+    warn "Rollback complete. Network restored to original state."
+    warn "Log: $LOG_FILE"
 }
 
 ############################
@@ -651,10 +855,19 @@ cleanup_on_error() {
 ############################
 
 save_state() {
-    echo "active" > "$STATE_FILE"
-    echo "MODE=$MODE" >> "$STATE_FILE"
-    echo "VIRT=$VIRT_TYPE" >> "$STATE_FILE"
-    echo "STARTED=$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
+    cat > "$STATE_FILE" <<EOF
+active
+MODE=$MODE
+RUNTIME_PROFILE=$RUNTIME_PROFILE
+TOR_ROUTING_MODE=$TOR_ROUTING_MODE
+VIRT=$_VIRT_RAW
+FALLBACK=$_FALLBACK_MODE
+SKIP_MAC=$SKIP_MAC
+SKIP_TRANSPARENT=$SKIP_TRANSPARENT
+SKIP_KILLSWITCH=$SKIP_KILLSWITCH
+ISTOR_OK=$_ISTOR_OK
+STARTED=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
 }
 
 clear_state() {
@@ -665,6 +878,11 @@ is_active() {
     [[ -f "$STATE_FILE" ]] && grep -q "^active" "$STATE_FILE" 2>/dev/null
 }
 
+state_val() {
+    [[ -f "$STATE_FILE" ]] && \
+        grep "^${1}=" "$STATE_FILE" | cut -d= -f2 || echo ""
+}
+
 ############################
 # START
 ############################
@@ -672,63 +890,82 @@ is_active() {
 start_ghostly() {
     require_root
     check_deps
-    detect_virt
+    detect_environment
+    resolve_profile
 
     if is_active; then
-        warn "Ghostly appears to already be active. Run 'ghostly off' first."
+        warn "Ghostly is already active. Run 'ghostly off' first."
         return 1
     fi
 
-    # Register rollback trap
     trap cleanup_on_error ERR
 
     log "==============================="
     log "  Starting Ghostly v${VERSION}"
-    log "  Mode: ${MODE}"
+    log "  Profile : ${RUNTIME_PROFILE}"
+    log "  Mode    : ${MODE}"
+    log "  Routing : ${TOR_ROUTING_MODE}"
     log "==============================="
 
-    # 1. Backup current state
+    # 1. Backup
     backup_routes
 
-    # 2. Configure Tor (write torrc.d snippet, restart)
+    # 2. Configure Tor (profile-aware torrc.d snippet)
     configure_tor
 
-    # 3. Spoof MAC before network changes
+    # 3. MAC spoof (skipped on VM/cloud/container/WSL)
     spoof_mac
 
-    # 4. Disable IPv6
+    # 4. IPv6 (skipped on cloud/container)
     disable_ipv6
 
-    # 5. Apply firewall in permissive mode (OUTPUT still ACCEPT)
+    # 5. Firewall — permissive (OUTPUT=ACCEPT) — skipped on WSL/container
     configure_firewall
 
-    # 6. Wait for Tor to fully bootstrap
-    if ! wait_for_tor; then
-        err "Tor failed to bootstrap within ${BOOTSTRAP_TIMEOUT}s."
-        err "Rolling back to prevent network lockout..."
-        cleanup_on_error
-        exit 1
+    # 6. Verification chain: service → SOCKS → bootstrap → exit IP
+    if ! run_verification_chain; then
+        # Transparent mode failed — try SOCKS fallback
+        if [[ "$TOR_ROUTING_MODE" == "transparent" ]]; then
+            warn "Transparent mode verification failed. Attempting SOCKS fallback..."
+            if ! fallback_to_socks; then
+                cleanup_on_error
+                exit 1
+            fi
+        else
+            err "Verification chain failed."
+            cleanup_on_error
+            exit 1
+        fi
     fi
 
-    # 7. Verify exit IP is Tor
-    verify_tor_ip
-
-    # 8. Lock DNS now that Tor is confirmed up
+    # 7. Lock DNS (after Tor confirmed, skipped on WSL/container)
     configure_dns
 
-    # 9. Activate kill-switch (OUTPUT → DROP)
+    # 8. Activate kill-switch (skipped on WSL/container)
     apply_killswitch
 
-    # 10. Save state
+    # 9. Save state
     save_state
 
-    # Remove trap (clean start)
     trap - ERR
 
     echo
     log "==============================="
-    log "  Ghostly ACTIVE"
+    if [[ "$_FALLBACK_MODE" -eq 1 ]]; then
+        warn "  Ghostly ACTIVE (SOCKS fallback mode)"
+        warn "  Use SOCKS5 127.0.0.1:${TOR_PORT}"
+    else
+        log "  Ghostly ACTIVE"
+    fi
     log "==============================="
+
+    # WSL-specific hint
+    if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
+        echo
+        info "WSL SOCKS5 proxy: 127.0.0.1:${TOR_PORT}"
+        info "Export for shell: export https_proxy=socks5h://127.0.0.1:${TOR_PORT}"
+        info "                  export http_proxy=socks5h://127.0.0.1:${TOR_PORT}"
+    fi
 }
 
 ############################
@@ -742,7 +979,6 @@ stop_ghostly() {
     log "  Stopping Ghostly"
     log "==============================="
 
-    # Always restore OUTPUT first
     ipt -P OUTPUT ACCEPT 2>/dev/null || true
     ipt -P INPUT  ACCEPT 2>/dev/null || true
 
@@ -769,29 +1005,25 @@ rotate_tor() {
 
     log "Requesting new Tor circuit..."
 
-    if ! nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
-        err "Tor control port not reachable. Is Ghostly active?"
+    nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null || {
+        err "Control port not reachable. Is Ghostly active?"
         return 1
-    fi
+    }
 
-    # Cookie auth — read binary cookie and hex-encode it
-    if [[ ! -r "$COOKIE_FILE" ]]; then
-        err "Tor cookie not readable: $COOKIE_FILE"
-        err "Ensure you are root and Tor is running."
+    [[ -r "$COOKIE_FILE" ]] || {
+        err "Cookie not readable: $COOKIE_FILE"
         return 1
-    fi
+    }
 
     local cookie_hex
-    cookie_hex="$(xxd -p "$COOKIE_FILE" | tr -d '\n')"
+    cookie_hex="$(xxd -p "$COOKIE_FILE" 2>/dev/null | tr -d '\n')"
 
     printf "AUTHENTICATE %s\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$cookie_hex" \
         | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" >/dev/null 2>&1
 
-    # Tor enforces 10s minimum between NEWNYM
     log "Waiting 10s for new circuit..."
     sleep 10
-
-    verify_tor_ip
+    verify_tor_exit
     log "Circuit rotated."
 }
 
@@ -806,59 +1038,92 @@ status_ghostly() {
     echo -e "${BLUE}${BOLD}=================================${NC}"
     echo
 
-    echo -n "  Active       : "
-    if is_active; then
-        echo -e "${GREEN}YES${NC}"
+    local active_profile active_routing active_mode fallback
+    active_profile="$(state_val RUNTIME_PROFILE)"
+    active_routing="$(state_val TOR_ROUTING_MODE)"
+    active_mode="$(state_val MODE)"
+    fallback="$(state_val FALLBACK)"
+
+    echo -n "  Active         : "
+    is_active && echo -e "${GREEN}YES${NC}" || echo -e "${RED}NO${NC}"
+
+    echo -n "  Runtime profile: "
+    [[ -n "$active_profile" ]] && echo "$active_profile" || echo "(not running)"
+
+    echo -n "  Routing mode   : "
+    if [[ -n "$active_routing" ]]; then
+        [[ "$fallback" == "1" ]] \
+            && echo -e "${YELLOW}${active_routing} (fallback)${NC}" \
+            || echo "$active_routing"
     else
-        echo -e "${RED}NO${NC}"
+        echo "(not running)"
     fi
 
-    echo -n "  Mode         : "
-    if [[ -f "$STATE_FILE" ]]; then
-        grep "^MODE=" "$STATE_FILE" | cut -d= -f2
-    else
-        echo "$MODE"
-    fi
-
-    echo -n "  Virt type    : "
-    detect_virt 2>/dev/null; echo "$VIRT_TYPE"
-
-    echo -n "  Network mgr  : "; detect_netman
-    echo -n "  FW backend   : "; detect_fw_backend
+    echo -n "  Privacy mode   : "; echo "${active_mode:-$MODE}"
+    echo -n "  Virt/env       : "; echo "${_VIRT_RAW:-unknown}"
+    echo -n "  Network mgr    : "; detect_netman
+    echo -n "  FW backend     : "; detect_fw_backend
 
     echo
-    echo -n "  Tor service  : "
+    echo -n "  Tor service    : "
     systemctl is-active tor 2>/dev/null || echo "inactive"
 
-    echo -n "  SOCKS port   : "
+    echo -n "  SOCKS port     : "
     nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null \
-        && echo "open ($TOR_PORT)" || echo -e "${RED}CLOSED${NC}"
+        && echo -e "${GREEN}open (${TOR_PORT})${NC}" \
+        || echo -e "${RED}CLOSED${NC}"
 
-    echo -n "  Control port : "
+    echo -n "  Control port   : "
     nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
-        && echo "open ($TOR_CONTROL_PORT)" || echo -e "${RED}CLOSED${NC}"
+        && echo "open ($TOR_CONTROL_PORT)" \
+        || echo -e "${RED}CLOSED${NC}"
 
-    echo -n "  Public IP    : "
-    torsocks curl -s --max-time 8 https://ipinfo.io/ip 2>/dev/null \
-        || echo "unavailable"
+    echo -n "  Transparent    : "
+    [[ "$(state_val SKIP_TRANSPARENT)" == "1" ]] \
+        && echo -e "${YELLOW}disabled (profile)${NC}" \
+        || echo -e "${GREEN}active${NC}"
+
+    echo -n "  Kill-switch    : "
+    if [[ "$(state_val SKIP_KILLSWITCH)" == "1" ]]; then
+        echo -e "${YELLOW}disabled (profile)${NC}"
+    else
+        ipt -L OUTPUT -n 2>/dev/null | grep -q "policy DROP" \
+            && echo -e "${GREEN}ACTIVE${NC}" \
+            || echo -e "${YELLOW}inactive${NC}"
+    fi
+
+    echo -n "  IsTor verified : "
+    [[ "$(state_val ISTOR_OK)" == "1" ]] \
+        && echo -e "${GREEN}YES${NC}" \
+        || echo -e "${YELLOW}unconfirmed${NC}"
+
+    echo -n "  Public IP      : "
+    if [[ "$active_routing" == "socks-only" ]]; then
+        curl -s --max-time 8 \
+            --socks5-hostname "127.0.0.1:${TOR_PORT}" \
+            https://ipinfo.io/ip 2>/dev/null || echo "unavailable"
+    else
+        torsocks curl -s --max-time 8 https://ipinfo.io/ip 2>/dev/null \
+            || echo "unavailable"
+    fi
     echo
 
-    echo -n "  Interface    : "; default_iface
-    echo -n "  MAC address  : "
-    local iface; iface="$(default_iface)"
-    cat /sys/class/net/"$iface"/address 2>/dev/null || echo "unknown"
+    echo -n "  Interface      : "; default_iface
+    echo -n "  MAC address    : "
+    local iface; iface="$(default_iface 2>/dev/null || true)"
+    [[ -n "$iface" ]] && cat /sys/class/net/"$iface"/address 2>/dev/null \
+        || echo "unknown"
 
-    echo -n "  IPv6 disabled: "
+    echo -n "  IPv6 disabled  : "
     sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown"
 
-    echo -n "  DNS server   : "
+    echo -n "  DNS server     : "
     grep "^nameserver" /etc/resolv.conf 2>/dev/null \
         | awk '{print $2}' | head -1 || echo "unknown"
 
-    echo -n "  Kill-switch  : "
-    ipt -L OUTPUT -n 2>/dev/null | grep -q "DROP" \
-        && echo -e "${GREEN}ACTIVE${NC}" || echo -e "${YELLOW}inactive${NC}"
-
+    echo
+    [[ -n "$(state_val STARTED)" ]] && \
+        echo "  Started: $(state_val STARTED)"
     echo
 }
 
@@ -867,43 +1132,78 @@ status_ghostly() {
 ############################
 
 diagnostics() {
+    detect_environment 2>/dev/null || true
+    resolve_profile 2>/dev/null || true
+
     echo
     echo -e "${BLUE}${BOLD}=================================${NC}"
     echo -e "${BLUE}${BOLD}      GHOSTLY DIAGNOSTICS        ${NC}"
     echo -e "${BLUE}${BOLD}=================================${NC}"
-    echo
 
-    echo -e "${BOLD}Environment:${NC}"
-    detect_virt 2>/dev/null
-    echo "  Virt type      : $VIRT_TYPE"
-    echo "  Skip MAC spoof : $([[ $SKIP_MAC -eq 1 ]] && echo YES || echo NO)"
+    echo
+    echo -e "${BOLD}── Environment ──${NC}"
+    echo "  OS             : $(grep PRETTY_NAME /etc/os-release 2>/dev/null \
+        | cut -d= -f2 | tr -d '"' || uname -s)"
+    echo "  Kernel         : $(uname -r)"
+    echo "  Virt (raw)     : $_VIRT_RAW"
+    echo "  Runtime profile: $RUNTIME_PROFILE"
     echo "  Network manager: $(detect_netman)"
     echo "  FW backend     : $(detect_fw_backend)"
-    echo "  Kernel         : $(uname -r)"
-    echo "  OS             : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || uname -s)"
 
     echo
-    echo -e "${BOLD}Tor:${NC}"
-    echo "  Service        : $(systemctl is-active tor 2>/dev/null || echo inactive)"
+    echo -e "${BOLD}── Profile Capabilities ──${NC}"
+    echo "  Routing mode        : $TOR_ROUTING_MODE"
+    echo "  Transparent routing : $([[ $SKIP_TRANSPARENT -eq 0 ]] && echo SUPPORTED || echo NOT SUPPORTED)"
+    echo "  MAC spoofing        : $([[ $SKIP_MAC -eq 0 ]] && echo SUPPORTED || echo SKIPPED)"
+    echo "  IPv6 disable        : $([[ $SKIP_IPV6 -eq 0 ]] && echo SUPPORTED || echo SKIPPED)"
+    echo "  DNS lock            : $([[ $SKIP_DNS_LOCK -eq 0 ]] && echo SUPPORTED || echo SKIPPED)"
+    echo "  Kill-switch         : $([[ $SKIP_KILLSWITCH -eq 0 ]] && echo SUPPORTED || echo SKIPPED)"
+
+    if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
+        echo
+        echo -e "  ${YELLOW}WSL WARNINGS:${NC}"
+        echo "  • Transparent iptables redirect not supported in WSL"
+        echo "  • DNS is managed by Windows — resolv.conf changes may revert"
+        echo "  • MAC spoofing not available on virtual adapters"
+        echo "  • Use SOCKS5 proxy: 127.0.0.1:${TOR_PORT}"
+        echo "  • Or set: export https_proxy=socks5h://127.0.0.1:${TOR_PORT}"
+    fi
+
+    echo
+    echo -e "${BOLD}── Tor Service ──${NC}"
+    echo "  Service status : $(systemctl is-active tor 2>/dev/null || echo inactive)"
     echo "  SOCKS port     : $(nc -z 127.0.0.1 $TOR_PORT 2>/dev/null && echo OPEN || echo CLOSED)"
     echo "  Control port   : $(nc -z 127.0.0.1 $TOR_CONTROL_PORT 2>/dev/null && echo OPEN || echo CLOSED)"
-    echo "  Cookie file    : $([[ -f "$COOKIE_FILE" ]] && echo EXISTS || echo MISSING)"
-    echo "  torrc.d snippet: $([[ -f "$TORRC_SNIPPET" ]] && echo EXISTS || echo NOT FOUND)"
+    echo "  Cookie file    : $([[ -f "$COOKIE_FILE" ]] && echo "EXISTS ($COOKIE_FILE)" || echo MISSING)"
+    echo "  torrc snippet  : $([[ -f "$TORRC_SNIPPET" ]] && echo "EXISTS ($TORRC_SNIPPET)" || echo "NOT FOUND")"
 
     echo
-    echo -e "${BOLD}Bootstrap status:${NC}"
-    journalctl -u tor --since "10 minutes ago" --no-pager -q 2>/dev/null \
-        | grep -i "bootstrap" | tail -3 || echo "  No recent bootstrap logs"
+    echo -e "${BOLD}── Bootstrap Status ──${NC}"
+    local phase
+    if nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
+        phase="$(echo -e "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
+            | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
+            | grep "bootstrap-phase" | grep -o "PROGRESS=[0-9]*" \
+            | cut -d= -f2 || echo "N/A")"
+        echo "  Bootstrap progress: ${phase}%"
+    else
+        echo "  Control port not available."
+    fi
+    echo "  Recent logs:"
+    journalctl -u tor --since "5 minutes ago" --no-pager -q 2>/dev/null \
+        | grep -i "bootstrap\|error\|warn" | tail -5 \
+        | sed 's/^/    /' || echo "    No recent bootstrap logs"
 
     echo
-    echo -e "${BOLD}Network:${NC}"
-    echo "  Default route  : $(ip route | grep default | head -1 || echo none)"
-    echo "  DNS config     : $(grep ^nameserver /etc/resolv.conf 2>/dev/null | head -3 || echo none)"
+    echo -e "${BOLD}── Network ──${NC}"
+    echo "  Default route  : $(ip route 2>/dev/null | grep default | head -1 || echo none)"
+    echo "  DNS config     : $(grep ^nameserver /etc/resolv.conf 2>/dev/null | head -2 || echo none)"
     echo "  IPv6 disabled  : $(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo unknown)"
 
     echo
-    echo -e "${BOLD}Firewall (OUTPUT chain):${NC}"
-    ipt -L OUTPUT -n --line-numbers 2>/dev/null | head -20 || echo "  Unable to read iptables"
+    echo -e "${BOLD}── Firewall (OUTPUT chain) ──${NC}"
+    ipt -L OUTPUT -n --line-numbers 2>/dev/null | head -20 \
+        | sed 's/^/  /' || echo "  Unable to read iptables"
 
     echo
 }
@@ -915,43 +1215,63 @@ diagnostics() {
 leak_test() {
     log "Running comprehensive leak test..."
 
+    # Detect how to route
+    local routing; routing="$(state_val TOR_ROUTING_MODE)"
+    [[ -z "$routing" ]] && routing="$TOR_ROUTING_MODE"
+
+    _curl() {
+        if [[ "$routing" == "socks-only" ]]; then
+            curl -s --max-time 15 \
+                --socks5-hostname "127.0.0.1:${TOR_PORT}" "$@"
+        else
+            torsocks curl -s --max-time 15 "$@"
+        fi
+    }
+
     echo
     echo -e "${BLUE}===== TOR CHECK =====${NC}"
-    torsocks curl -s --max-time 10 https://check.torproject.org/api/ip 2>/dev/null \
+    _curl https://check.torproject.org/api/ip 2>/dev/null \
         | python3 -m json.tool 2>/dev/null || echo "unavailable"
 
     echo
     echo -e "${BLUE}===== PUBLIC IP =====${NC}"
-    torsocks curl -s --max-time 10 https://ipinfo.io 2>/dev/null \
+    _curl https://ipinfo.io 2>/dev/null \
         | python3 -m json.tool 2>/dev/null || echo "unavailable"
 
     echo
     echo -e "${BLUE}===== DNS LEAK =====${NC}"
-    torsocks curl -s --max-time 10 "https://bash.ws/dnsleak/test/$RANDOM" 2>/dev/null \
+    _curl "https://bash.ws/dnsleak/test/$RANDOM" 2>/dev/null \
         | python3 -m json.tool 2>/dev/null || \
         torsocks dig +short TXT whoami.cloudflare @1.1.1.1 2>/dev/null || \
         echo "DNS test unavailable"
 
     echo
     echo -e "${BLUE}===== WEBRTC =====${NC}"
-    echo "  WebRTC cannot be tested from CLI."
+    echo "  Cannot be tested from CLI."
     echo "  Visit: https://browserleaks.com/webrtc"
 
     echo
     echo -e "${BLUE}===== IPV6 LEAK =====${NC}"
-    if sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q "^1"; then
-        echo "  IPv6 disabled — no IPv6 leak possible."
-    else
-        warn "  IPv6 ENABLED — possible leak!"
-    fi
+    sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q "^1" \
+        && echo "  IPv6 disabled — no leak possible." \
+        || warn "  IPv6 ENABLED — possible leak!"
 
     echo
     echo -e "${BLUE}===== KILL-SWITCH =====${NC}"
-    if ipt -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
-        echo "  Kill-switch: ACTIVE (OUTPUT policy DROP)"
+    if [[ "$(state_val SKIP_KILLSWITCH)" == "1" ]]; then
+        warn "  Kill-switch disabled for profile: $(state_val RUNTIME_PROFILE)"
+        warn "  SOCKS-only profile — applications must route via SOCKS5"
+    elif ipt -L OUTPUT -n 2>/dev/null | grep -q "policy DROP"; then
+        echo -e "  ${GREEN}Kill-switch ACTIVE (OUTPUT DROP)${NC}"
     else
-        warn "  Kill-switch: NOT ACTIVE"
+        warn "  Kill-switch NOT ACTIVE"
     fi
+
+    echo
+    echo -e "${BLUE}===== ROUTING MODE =====${NC}"
+    echo "  Active routing: ${routing:-unknown}"
+    [[ "$routing" == "socks-only" ]] && \
+        echo "  SOCKS5 endpoint: 127.0.0.1:${TOR_PORT}"
 
     echo
 }
@@ -961,13 +1281,16 @@ leak_test() {
 ############################
 
 menu() {
+    detect_environment 2>/dev/null || true
     while true; do
         clear
         echo -e "${BLUE}${BOLD}=================================${NC}"
         echo -e "${BLUE}${BOLD}            GHOSTLY              ${NC}"
         echo -e "${BLUE}${BOLD}=================================${NC}"
         echo
-        echo -e "  Mode: ${CYAN}$MODE${NC}  |  Virt: ${CYAN}${VIRT_TYPE:-detecting...}${NC}"
+        echo -e "  Profile : ${CYAN}${RUNTIME_PROFILE:-detecting...}${NC}"
+        echo -e "  Mode    : ${CYAN}$MODE${NC}"
+        echo -e "  Routing : ${CYAN}${TOR_ROUTING_MODE:-auto}${NC}"
         echo
         echo "  1. Enable Ghostly"
         echo "  2. Disable Ghostly"
@@ -1000,7 +1323,6 @@ menu() {
 ############################
 
 mkdir -p "$(dirname "$LOG_FILE")" "$CONFIG_DIR" "$BACKUP_DIR"
-detect_virt 2>/dev/null || true
 
 case "${1:-}" in
     install)
@@ -1008,8 +1330,8 @@ case "${1:-}" in
         install_deps
         ;;
     on|start)
-        # Allow mode override: ghostly on --mode strict
         [[ "${2:-}" == "--mode" ]] && MODE="${3:-balanced}"
+        [[ "${2:-}" == "--profile" ]] && RUNTIME_PROFILE="${3:-}"
         start_ghostly
         ;;
     off|stop)
@@ -1019,12 +1341,14 @@ case "${1:-}" in
         rotate_tor
         ;;
     status)
+        detect_environment 2>/dev/null || true
         status_ghostly
         ;;
     leak-test)
         leak_test
         ;;
     diag|diagnostics)
+        require_root
         diagnostics
         ;;
     menu)
@@ -1035,25 +1359,33 @@ case "${1:-}" in
         ;;
     *)
         echo
-        echo -e "${BOLD}Ghostly${NC} - Hardened Anonymous Networking Toolkit"
+        echo -e "${BOLD}Ghostly${NC} — Adaptive Hardened Anonymity Toolkit"
         echo
         echo "Usage:"
-        echo "  sudo ghostly install              Install dependencies"
-        echo "  sudo ghostly on                   Enable Ghostly (balanced mode)"
-        echo "  sudo ghostly on --mode strict     Enable with strict mode"
-        echo "  sudo ghostly on --mode safe       Enable with safe mode"
-        echo "  sudo ghostly off                  Disable Ghostly"
-        echo "  sudo ghostly rotate               Rotate Tor circuit"
-        echo "  sudo ghostly status               Show status"
-        echo "  sudo ghostly leak-test            Run leak tests"
-        echo "  sudo ghostly diag                 Environment diagnostics"
-        echo "  sudo ghostly menu                 Interactive menu"
-        echo "  ghostly --version                 Show version"
+        echo "  sudo ghostly install                Install dependencies"
+        echo "  sudo ghostly on                     Enable (auto-detect profile)"
+        echo "  sudo ghostly on --mode strict       Enable with strict privacy mode"
+        echo "  sudo ghostly on --mode safe         Enable with safe stability mode"
+        echo "  sudo ghostly on --profile wsl       Force a specific runtime profile"
+        echo "  sudo ghostly off                    Disable & restore everything"
+        echo "  sudo ghostly rotate                 Rotate Tor circuit"
+        echo "  sudo ghostly status                 Show full status"
+        echo "  sudo ghostly leak-test              Run leak tests"
+        echo "  sudo ghostly diag                   Environment diagnostics"
+        echo "  sudo ghostly menu                   Interactive menu"
+        echo "  ghostly --version                   Show version"
         echo
-        echo "Modes:"
+        echo "Privacy Modes:"
         echo "  balanced   Default. LAN excluded, standard circuits."
-        echo "  strict     LAN also through Tor. Reduced circuits. Max privacy."
+        echo "  strict     LAN also via Tor. Reduced circuits. Max privacy."
         echo "  safe       LAN excluded, more circuits. Max stability."
+        echo
+        echo "Runtime Profiles (auto-detected):"
+        echo "  baremetal  Full transparent routing + MAC spoof + kill-switch"
+        echo "  vm         Transparent routing, MAC skipped"
+        echo "  cloud      Transparent routing, MAC + IPv6 skipped"
+        echo "  wsl        SOCKS-only, no kernel modifications"
+        echo "  container  SOCKS-only, no kernel modifications"
         echo
         ;;
 esac
