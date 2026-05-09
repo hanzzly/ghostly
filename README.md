@@ -16,7 +16,7 @@ A hardened anonymous networking toolkit for Linux that routes all traffic throug
 - 🔄 **Circuit rotation** — request a new Tor identity on demand
 - ✅ **Bootstrap verification** — confirms Tor is fully connected before proceeding
 - 🧪 **Leak test** — checks IP, DNS, and IPv6 for any exposure
-- 📋 **Full logging** — timestamped log at `/var/log/ghost.log`
+- 📋 **Full logging** — timestamped log at `/var/log/ghostly.log`
 
 ---
 
@@ -45,19 +45,20 @@ sudo ghostly install
 ## Usage
 
 ```bash
-sudo ghostly on           # Enable Ghost Mode
-sudo ghostly off          # Disable Ghost Mode
+sudo ghostly on           # Enable Ghostly
+sudo ghostly off          # Disable Ghostly
 sudo ghostly rotate       # Rotate Tor circuit (new identity)
 sudo ghostly status       # Show current status
 sudo ghostly leak-test    # Run leak tests
 sudo ghostly menu         # Interactive menu
+ghostly --version         # Show version
 ```
 
 ---
 
 ## How It Works
 
-### When `ghost on` is run:
+### When `ghostly on` is run:
 
 ```
 1. Configure Tor      → torrc with TransPort, DNSPort, HashedControlPassword
@@ -83,11 +84,11 @@ NAT     TCP → TransPort (9040)
 NAT     DNS UDP/TCP → DNSPort (5353)
 ```
 
-### When `ghost off` is run:
+### When `ghostly off` is run:
 
 ```
-1. Restore iptables   → from backup at /var/lib/ghost/iptables.bak
-2. Restore DNS        → from backup at /var/lib/ghost/resolv.conf.bak
+1. Restore iptables   → from backup at /var/lib/ghostly/iptables.bak
+2. Restore DNS        → from backup at /var/lib/ghostly/resolv.conf.bak
 3. Restore MAC        → macchanger -p restores permanent address
 4. Re-enable IPv6     → sysctl + removes sysctl.d config
 5. Stop Tor           → systemctl stop tor
@@ -99,11 +100,11 @@ NAT     DNS UDP/TCP → DNSPort (5353)
 
 | Path | Purpose |
 |------|---------|
-| `/etc/ghost/` | Ghost config directory |
-| `/etc/ghost/.ctrl_pass` | Tor control password (root-only, `chmod 600`) |
-| `/var/lib/ghost/` | Backups (iptables, resolv.conf, torrc) |
-| `/var/log/ghost.log` | Timestamped activity log |
-| `/etc/sysctl.d/99-ghost-no-ipv6.conf` | IPv6 disable persistence |
+| `/etc/ghostly/` | Ghostly config directory |
+| `/etc/ghostly/.ctrl_pass` | Tor control password (root-only, `chmod 600`) |
+| `/var/lib/ghostly/` | Backups (iptables, resolv.conf, torrc) |
+| `/var/log/ghostly.log` | Timestamped activity log |
+| `/etc/sysctl.d/99-ghostly-no-ipv6.conf` | IPv6 disable persistence |
 
 ---
 
@@ -112,8 +113,8 @@ NAT     DNS UDP/TCP → DNSPort (5353)
 - The Tor control port uses `HashedControlPassword` (auto-generated per hostname). Plain `AUTHENTICATE` without credentials will be rejected.
 - `resolv.conf` is locked with `chattr +i` to prevent NetworkManager or other daemons from overwriting it.
 - IPv6 is disabled at the kernel level and persisted via `sysctl.d` to survive interface hotplug events.
-- Backups of iptables, DNS, and Tor config are taken before any modification, so `ghost off` cleanly restores your original state.
-- WebRTC leaks cannot be prevented at the OS level — use a browser extension (e.g. uBlock Origin) or a Tor Browser.
+- Backups of iptables, DNS, and Tor config are taken before any modification, so `ghostly off` cleanly restores your original state.
+- WebRTC leaks cannot be prevented at the OS level — use a browser extension (e.g. uBlock Origin) or Tor Browser.
 
 ---
 
@@ -121,7 +122,7 @@ NAT     DNS UDP/TCP → DNSPort (5353)
 
 - **WebRTC**: Cannot be blocked from the terminal. Check manually at [browserleaks.com/webrtc](https://browserleaks.com/webrtc).
 - **UDP traffic (non-DNS)**: Tor only supports TCP. Non-DNS UDP is blocked by the kill-switch (dropped, not leaked).
-- **Tor Browser**: For maximum browser anonymity, use [Tor Browser](https://www.torproject.org/download/) alongside this toolkit.
+- **Tor Browser**: For maximum browser anonymity, use [Tor Browser](https://www.torproject.org/download/) alongside Ghostly.
 - **Speed**: All traffic through Tor will be slower than a direct connection. This is expected.
 
 ---
@@ -134,4 +135,4 @@ This tool is provided for **educational and legitimate privacy use only**. The a
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
