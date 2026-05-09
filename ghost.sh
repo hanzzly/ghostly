@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ghostly.sh - Hardened Anonymous Networking Toolkit
+# ghostly.sh - Hardened Anonymous Networking Toolkit v2.0
 #
 
 set -Eeuo pipefail
