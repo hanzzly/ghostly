@@ -18,7 +18,7 @@ Ghostly adalah toolkit anonimitas berbasis Bash yang merutekan seluruh traffic s
 - **Kunci DNS** — menulis `nameserver 127.0.0.1` dan mengunci `/etc/resolv.conf` secara immutable
 - **Rotasi sirkuit** — mengirim `SIGNAL NEWNYM` melalui control port dengan cookie auth
 - **Auto-rollback** — ERR trap memulihkan firewall, DNS, MAC, IPv6, dan route jika terjadi error
-- **Firewall idempoten** — memanggil `configure_firewall` dua kali tetap aman; tidak ada jendela bocor antara flush dan kill-switch
+- **Firewall rollback-aware** — backup & restore rules otomatis jika terjadi error
 - **Arsitektur torrc** — tidak pernah menimpa `/etc/tor/torrc`; semua konfigurasi runtime ditulis ke `/etc/tor/torrc.d/ghostly.conf`
 
 ---
@@ -135,7 +135,12 @@ Ghostly mendeteksi environment menggunakan strategi 3 lapis: `systemd-detect-vir
 
 ### Profil SOCKS-only (WSL / container)
 
-Di WSL dan container, Ghostly menjalankan Tor dan mengekspos proxy SOCKS5 di `127.0.0.1:9050`. Tidak ada perubahan kernel yang dilakukan. Aplikasi harus dikonfigurasi secara eksplisit untuk menggunakan proxy ini.
+Di WSL dan container, Ghostly menjalankan Tor dan mengekspos proxy SOCKS5 di `127.0.0.1:9050`. Tidak ada perubahan kernel yang dilakukan. Aplikasi harus dikonfigurasi secara eksplisit untuk menggunakan proxy ini. DNS leak test CLI mungkin gagal karena keterbatasan networking virtualized environment. Verifikasi tambahan bisa dilakukan melalui browser:
+- https://browserleaks.com/dns
+- https://dnsleaktest.com
+
+> Pada profil SOCKS-only, hanya aplikasi yang menggunakan proxy SOCKS5 yang akan melalui Tor.
+> Traffic biasa (`curl`, browser, package manager, dll) tetap menggunakan koneksi normal kecuali proxy diaktifkan.
 
 ```bash
 # Terapkan ke shell saat ini
@@ -253,7 +258,7 @@ NAT OUTPUT:
 
 ## Pemecahan Masalah
 
-**Tor gagal start — "Address already in use"**
+**- Tor gagal start — "Address already in use"**
 
 File `/etc/tor/torrc` kemungkinan memiliki direktif port yang konflik dari instalasi Tor sebelumnya.
 
@@ -262,14 +267,14 @@ sudo ghostly fix-torrc
 sudo ghostly diag
 ```
 
-**Bootstrap timeout**
+**- Bootstrap timeout**
 
 ```bash
 sudo ghostly diag     # menampilkan % bootstrap live dan log Tor terbaru
 sudo ghostly rotate   # minta sirkuit baru
 ```
 
-**SSH terputus setelah mengaktifkan strict mode di server cloud**
+**- SSH terputus setelah mengaktifkan strict mode di server cloud**
 
 Strict mode merutekan semua traffic termasuk koneksi SSH melalui Tor. Aktifkan kembali melalui konsol VPS dan ganti ke mode `balanced`:
 
@@ -278,7 +283,7 @@ sudo ghostly off
 sudo ghostly on --mode balanced
 ```
 
-**WSL: proxy tidak berjalan setelah diaktifkan**
+**- WSL: proxy tidak berjalan setelah diaktifkan**
 
 WSL tidak dapat memodifikasi kernel networking. Terapkan proxy ke shell secara manual:
 
@@ -287,7 +292,19 @@ eval "$(ghostly env)"
 curl https://check.torproject.org/api/ip
 ```
 
-**Verifikasi Tor aktif**
+**- WSL: koneksi tetap rusak setelah `ghostly off`**
+
+WSL kadang menyimpan state networking atau DNS cache internal meskipun Ghostly sudah dimatikan.
+
+Reset instance WSL dari Windows:
+
+```powershell
+wsl --shutdown
+```
+
+Lalu buka kembali distro Linux.
+
+**- Verifikasi Tor aktif**
 
 ```bash
 sudo ghostly status
@@ -305,6 +322,9 @@ sudo ghostly leak-test
 - `strict` mode menonaktifkan pengecualian LAN. Semua traffic termasuk LAN, SSH, dan antarmuka manajemen dialihkan melalui Tor.
 
 ---
+
+## Disclaimer
+Ghostly bukan pengganti OPSEC. Browser fingerprinting, akun login, WebRTC, extensions, dan perilaku pengguna masih dapat membocorkan identitas.
 
 ## Lisensi
 
