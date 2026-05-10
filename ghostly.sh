@@ -803,14 +803,24 @@ EOF
 }
 
 restore_dns() {
+    # WSL/container: jangan sentuh resolv.conf
+    if [[ "$SKIP_DNS_LOCK" -eq 1 ]]; then
+        info "DNS restore skipped (profile: $RUNTIME_PROFILE)."
+        return 0
+    fi
+
     log "Restoring DNS..."
     chattr -i /etc/resolv.conf 2>/dev/null || true
+
     if [[ -f "$BACKUP_DIR/resolv.conf.bak" ]]; then
         cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
         log "DNS restored."
     else
-        warn "No DNS backup. Falling back to 8.8.8.8."
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        warn "No DNS backup. Falling back to Cloudflare DNS."
+        cat > /etc/resolv.conf <<EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
     fi
 }
 
@@ -1216,6 +1226,11 @@ stop_ghostly() {
 
     log "Ghostly DISABLED."
     warn "Your real IP is now exposed."
+
+    if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
+        warn "WSL networking may require reset if connectivity breaks."
+        warn "Run: wsl --shutdown (from Windows)"
+    fi
 }
 
 ############################
