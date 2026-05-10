@@ -278,7 +278,7 @@ resolve_profile() {
             SKIP_MAC=1
             SKIP_TRANSPARENT=1
             SKIP_DNS_LOCK=1   # WSL DNS managed by Windows
-            SKIP_IPV6=0
+            SKIP_IPV6=1
             SKIP_KILLSWITCH=1
             warn "Profile: WSL — SOCKS-only mode, no kernel networking changes"
             warn "WSL: Configure applications to use SOCKS5 127.0.0.1:${TOR_PORT}"
@@ -576,6 +576,32 @@ validate_tor_config() {
     fi
 }
 
+service_start() {
+    if pidof systemd >/dev/null 2>&1; then
+        systemctl restart tor
+    else
+        service tor restart >/dev/null 2>&1 || \
+        /etc/init.d/tor restart >/dev/null 2>&1
+    fi
+}
+
+service_stop() {
+    if pidof systemd >/dev/null 2>&1; then
+        systemctl stop tor
+    else
+        service tor stop >/dev/null 2>&1 || \
+        /etc/init.d/tor stop >/dev/null 2>&1
+    fi
+}
+
+service_active() {
+    if pidof systemd >/dev/null 2>&1; then
+        systemctl is-active --quiet tor
+    else
+        pgrep -x tor >/dev/null 2>&1
+    fi
+}
+
 # Main configure_tor — orchestrates the full flow
 configure_tor() {
     log "Configuring Tor (profile: $RUNTIME_PROFILE, mode: $MODE, routing: $TOR_ROUTING_MODE)..."
@@ -599,7 +625,7 @@ configure_tor() {
     fi
 
     # Step 4: Restart Tor
-    systemctl restart tor
+    service_start
     log "Tor configured and restarted."
 }
 
@@ -618,7 +644,7 @@ fix_torrc() {
 
 # Step 1: Tor service active
 verify_service() {
-    if ! systemctl is-active --quiet tor 2>/dev/null; then
+    if ! service_active 2>/dev/null; then
         err "Tor service is not active."
         return 1
     fi
@@ -636,7 +662,7 @@ verify_socks_port() {
             return 0
         fi
         sleep 2
-        (( attempts++ ))
+        attempts=$((attempts + 1))
     done
     err "SOCKS port ${TOR_PORT} not open after 20s."
     return 1
@@ -644,6 +670,11 @@ verify_socks_port() {
 
 # Step 3: Bootstrap to 100%
 verify_bootstrap() {
+    if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
+        log "WSL detected — skipping journal bootstrap verification."
+        return 0
+    fi
+    
     log "Waiting for Tor bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
     local elapsed=0
 
@@ -672,7 +703,7 @@ verify_bootstrap() {
         fi
 
         sleep 3
-        (( elapsed += 3 ))
+        elapsed=$((elapsed + 3))
     done
     echo
 
@@ -830,7 +861,7 @@ spoof_mac() {
             return 0
         fi
         ip link set "$iface" up
-        (( attempt++ ))
+        attempt=$((attempt + 1))
         warn "MAC spoof attempt $attempt failed, retrying..."
         sleep 2
     done
@@ -999,7 +1030,7 @@ cleanup_on_error() {
     enable_ipv6
     restore_routes
 
-    systemctl stop tor 2>/dev/null || true
+    service_stop 2>/dev/null || true
 
     # Restore previous snippet if we have one, else remove
     if [[ -f "${TORRC_SNIPPET}.bak" ]]; then
@@ -1165,7 +1196,7 @@ stop_ghostly() {
     enable_ipv6
     restore_routes
 
-    systemctl stop tor 2>/dev/null || true
+    service_stop 2>/dev/null || true
     rm -f "$TORRC_SNIPPET" 2>/dev/null || true
     clear_state
 
@@ -1243,7 +1274,7 @@ status_ghostly() {
 
     echo
     echo -n "  Tor service    : "
-    systemctl is-active tor 2>/dev/null || echo "inactive"
+    service_active && echo "active" || echo "inactive"
 
     echo -n "  SOCKS port     : "
     nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null \
@@ -1419,7 +1450,7 @@ diagnostics() {
 
     echo
     echo -e "${BOLD}── Tor Service ──${NC}"
-    echo "  Service status : $(systemctl is-active tor 2>/dev/null || echo inactive)"
+    echo "  Service status : $(service_active && echo active || echo inactive)"
     echo "  SOCKS port     : $(nc -z 127.0.0.1 $TOR_PORT 2>/dev/null && echo -e "${GREEN}OPEN${NC}" || echo -e "${RED}CLOSED${NC}")"
     echo "  Control port   : $(nc -z 127.0.0.1 $TOR_CONTROL_PORT 2>/dev/null && echo "open ($TOR_CONTROL_PORT)" || echo -e "${RED}CLOSED${NC}")"
     echo "  Cookie file    : $([[ -f "$COOKIE_FILE" ]] && echo "EXISTS ($COOKIE_FILE)" || echo "MISSING")"
@@ -1498,6 +1529,7 @@ leak_test() {
     # Detect how to route
     local routing; routing="$(state_val TOR_ROUTING_MODE)"
     [[ -z "$routing" ]] && routing="$TOR_ROUTING_MODE"
+    [[ -z "$routing" ]] && routing="socks-only"
 
     _curl() {
         if [[ "$routing" == "socks-only" ]]; then
