@@ -133,15 +133,56 @@ require_root() {
 check_deps() {
     local missing=()
 
-    for bin in tor nc ip sysctl curl; do
+    for bin in tor ip sysctl curl torsocks; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
+
+    # nc is optional — we use a portable wrapper; warn if missing
+    if ! command -v nc >/dev/null 2>&1 && ! command -v socat >/dev/null 2>&1; then
+        missing+=("netcat or socat")
+    fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "Missing: ${missing[*]}. Run: sudo ghostly install"
     fi
 
     return 0
+}
+
+############################
+# PORTABLE TCP CHECK
+# Replaces nc -z which is not portable across BSD/GNU/BusyBox.
+# Uses socat if available, falls back to /dev/tcp, then nc.
+############################
+
+# tcp_check HOST PORT — returns 0 if port open, 1 otherwise
+tcp_check() {
+    local host="$1" port="$2"
+    if command -v socat >/dev/null 2>&1; then
+        socat /dev/null "TCP:${host}:${port},connect-timeout=2" 2>/dev/null
+        return $?
+    elif [[ -e /dev/tcp ]]; then
+        # bash built-in — works on Linux, not BusyBox
+        (echo >/dev/tcp/"${host}"/"${port}") 2>/dev/null
+        return $?
+    elif command -v nc >/dev/null 2>&1; then
+        # Try GNU nc (-z -w2), ignore unknown-flag errors from BSD nc
+        nc -z -w2 "${host}" "${port}" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# tcp_send HOST PORT DATA — send data, return stdout; portable
+# Uses socat first (reliable), falls back to nc without -q flag
+tcp_send() {
+    local host="$1" port="$2" data="$3"
+    if command -v socat >/dev/null 2>&1; then
+        printf '%s' "$data" | socat - "TCP:${host}:${port},connect-timeout=3" 2>/dev/null
+    elif command -v nc >/dev/null 2>&1; then
+        # BSD nc has no -q; GNU nc has -q; use timeout wrapper instead
+        printf '%s' "$data" | timeout 3 nc "${host}" "${port}" 2>/dev/null
+    fi
 }
 
 ############################
@@ -276,6 +317,8 @@ resolve_profile() {
             SKIP_IPV6=1       # Cloud VPS often needs IPv6 for management
             SKIP_KILLSWITCH=0
             warn "Profile: CLOUD — transparent routing, MAC+IPv6 skipped"
+            warn "CLOUD + STRICT WARNING: kill-switch will block non-Tor traffic."
+            warn "Ensure SSH/management IP is whitelisted via --whitelist-ip before enabling."
             ;;
 
         wsl)
@@ -354,7 +397,7 @@ install_deps() {
     apt-get install -y \
         tor torsocks proxychains4 macchanger curl \
         iptables iptables-persistent iproute2 \
-        netcat-openbsd dnsutils nftables xxd
+        netcat-openbsd socat dnsutils nftables xxd
     log "Dependencies installed."
 }
 
@@ -666,7 +709,7 @@ verify_service() {
 verify_socks_port() {
     local attempts=0
     while (( attempts < 10 )); do
-        if nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null; then
+        if tcp_check 127.0.0.1 "$TOR_PORT"; then
             _SOCKS_OK=1
             log "Verification [2/4]: SOCKS port open (127.0.0.1:${TOR_PORT})."
             return 0
@@ -678,37 +721,52 @@ verify_socks_port() {
     return 1
 }
 
+############################
+# BOOTSTRAP VERIFICATION
+#
+# FIX: Use control port GETINFO as primary source of truth.
+# Journal polling was the secondary fallback but caused a race:
+# "3 minutes ago" window + sleep 3 loop could overlap or miss
+# the bootstrap completion line on slow systems.
+#
+# New strategy:
+#   Primary  → GETINFO status/bootstrap-phase (authoritative, real-time)
+#   Fallback → journal scan (only if control port unreachable)
+############################
+
 # Step 3: Bootstrap to 100%
 verify_bootstrap() {
     if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
         log "WSL detected — skipping journal bootstrap verification."
         return 0
     fi
-    
+
     log "Waiting for Tor bootstrap (timeout: ${BOOTSTRAP_TIMEOUT}s)..."
     local elapsed=0
 
     while (( elapsed < BOOTSTRAP_TIMEOUT )); do
-        # Primary: journalctl
-        if journalctl -u tor --since "3 minutes ago" --no-pager -q 2>/dev/null \
-            | grep -q "Bootstrapped 100%"; then
-            log "Verification [3/4]: Bootstrap 100% (journal)."
-            return 0
-        fi
 
-        # Secondary: control port GETINFO
-        if nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
+        # Primary: control port GETINFO (authoritative, no race)
+        if tcp_check 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
             local phase
-            phase="$(echo -e "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
-                | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
+            phase="$(tcp_send 127.0.0.1 "$TOR_CONTROL_PORT" \
+                "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
                 | grep "PROGRESS=" | grep -o "PROGRESS=[0-9]*" | cut -d= -f2 || echo 0)"
+
             if [[ "$phase" == "100" ]]; then
+                echo    # clear progress line
                 log "Verification [3/4]: Bootstrap 100% (control port)."
                 return 0
             fi
-            # Show live progress
-            echo -ne "\r${CYAN}[i]${NC} Bootstrap progress: ${phase}%  (${elapsed}s / ${BOOTSTRAP_TIMEOUT}s)"
+            echo -ne "\r${CYAN}[i]${NC} Bootstrap progress: ${phase:-0}%  (${elapsed}s / ${BOOTSTRAP_TIMEOUT}s)"
         else
+            # Fallback: journal scan (only when control port not yet open)
+            if journalctl -u tor --since "3 minutes ago" --no-pager -q 2>/dev/null \
+                | grep -q "Bootstrapped 100%"; then
+                echo
+                log "Verification [3/4]: Bootstrap 100% (journal fallback)."
+                return 0
+            fi
             echo -ne "\r${YELLOW}[*]${NC} Bootstrapping... ${elapsed}s / ${BOOTSTRAP_TIMEOUT}s"
         fi
 
@@ -717,7 +775,14 @@ verify_bootstrap() {
     done
     echo
 
-    # Fallback: SOCKS open is better than nothing
+    # Last-chance: journal scan before giving up
+    if journalctl -u tor --since "5 minutes ago" --no-pager -q 2>/dev/null \
+        | grep -q "Bootstrapped 100%"; then
+        log "Verification [3/4]: Bootstrap 100% (journal last-chance)."
+        return 0
+    fi
+
+    # Soft fail — SOCKS open is better than nothing
     if [[ "$_SOCKS_OK" -eq 1 ]]; then
         warn "Verification [3/4]: Bootstrap log not confirmed. SOCKS open — proceeding with caution."
         return 0
@@ -902,26 +967,25 @@ restore_mac() {
 
 ############################
 # FIREWALL
+#
+# FIX: configure_firewall is now idempotent.
+# Previously: flush + rebuild unconditionally — calling twice while
+# active caused an intermittent window where OUTPUT=ACCEPT (open)
+# between flush and kill-switch re-application.
+#
+# New strategy:
+#   1. Check if ghostly chain already exists (_GHOSTLY_FW_ACTIVE flag).
+#   2. If active, skip re-application and return early.
+#   3. Only flush + rebuild on first call (or after explicit restore_firewall).
+#
+# This ensures configure_firewall is safe to call multiple times
+# (e.g. from fallback_to_socks) without creating a traffic-leak window.
 ############################
 
-backup_firewall() {
-    mkdir -p "$BACKUP_DIR"
-    ipt_save > "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
-}
+_GHOSTLY_FW_ACTIVE=0
 
-restore_firewall() {
-    # Always ensure OUTPUT is open first
-    ipt -P OUTPUT ACCEPT 2>/dev/null || true
-    ipt -P INPUT  ACCEPT 2>/dev/null || true
-
-    if [[ -f "$BACKUP_DIR/iptables.bak" ]]; then
-        ipt_restore < "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
-        log "Firewall restored from backup."
-    else
-        warn "No firewall backup. Resetting to ACCEPT-all."
-        ipt -F; ipt -t nat -F; ipt -t mangle -F
-        ipt -P INPUT ACCEPT; ipt -P FORWARD ACCEPT; ipt -P OUTPUT ACCEPT
-    fi
+_fw_chain_exists() {
+    ipt -L GHOSTLY_OUTPUT -n &>/dev/null 2>&1
 }
 
 configure_firewall() {
@@ -930,11 +994,22 @@ configure_firewall() {
         return 0
     fi
 
+    # Idempotency guard: skip if already applied this session
+    if [[ "$_GHOSTLY_FW_ACTIVE" -eq 1 ]] && _fw_chain_exists; then
+        info "Firewall already configured — skipping re-application."
+        return 0
+    fi
+
     log "Applying transparent firewall (mode: $MODE)..."
     backup_firewall
-
+    
+    warn "Flushing existing iptables rules."
+    warn "Docker/VPN/custom firewall rules may be disrupted."
     ipt -F; ipt -t nat -F; ipt -t mangle -F
     ipt -X 2>/dev/null || true
+
+    # Create named chain for idempotency tracking
+    ipt -N GHOSTLY_OUTPUT 2>/dev/null || true
 
     # START PERMISSIVE — OUTPUT → DROP only after Tor verified
     ipt -P INPUT   DROP
@@ -965,6 +1040,8 @@ configure_firewall() {
         log "LAN ranges excluded from Tor redirect."
     else
         warn "Strict mode: all traffic redirected through Tor."
+        warn "STRICT MODE WARNING: SSH/management access may be disrupted."
+        warn "Whitelist management IPs before enabling strict mode on cloud/remote servers."
     fi
 
     # NAT: redirect TCP → TransPort
@@ -978,6 +1055,7 @@ configure_firewall() {
     ipt -A OUTPUT -p udp --dport 53 -m owner --uid-owner "$TOR_USER" -j ACCEPT
     ipt -A OUTPUT -p tcp --dport 53 -m owner --uid-owner "$TOR_USER" -j ACCEPT
 
+    _GHOSTLY_FW_ACTIVE=1
     log "Firewall applied (OUTPUT=ACCEPT, awaiting kill-switch activation)."
 }
 
@@ -992,6 +1070,29 @@ apply_killswitch() {
     # Safety net — always keep Tor daemon allowed
     ipt -A OUTPUT -m owner --uid-owner "$TOR_USER" -j ACCEPT 2>/dev/null || true
     log "Kill-switch active. All non-Tor traffic blocked."
+}
+
+backup_firewall() {
+    mkdir -p "$BACKUP_DIR"
+    ipt_save > "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
+}
+
+restore_firewall() {
+    # Always ensure OUTPUT is open first
+    ipt -P OUTPUT ACCEPT 2>/dev/null || true
+    ipt -P INPUT  ACCEPT 2>/dev/null || true
+
+    if [[ -f "$BACKUP_DIR/iptables.bak" ]]; then
+        ipt_restore < "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
+        log "Firewall restored from backup."
+    else
+        warn "No firewall backup. Resetting to ACCEPT-all."
+        ipt -F; ipt -t nat -F; ipt -t mangle -F
+        ipt -X 2>/dev/null || true
+        ipt -P INPUT ACCEPT; ipt -P FORWARD ACCEPT; ipt -P OUTPUT ACCEPT
+    fi
+
+    _GHOSTLY_FW_ACTIVE=0
 }
 
 ############################
@@ -1011,6 +1112,7 @@ fallback_to_socks() {
     warn "═══════════════════════════════════════════"
 
     # Restore firewall to safe state before retrying
+    # configure_firewall idempotency flag is reset by restore_firewall
     restore_firewall
     restore_dns
 
@@ -1244,7 +1346,7 @@ rotate_tor() {
 
     log "Requesting new Tor circuit..."
 
-    nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null || {
+    tcp_check 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null || {
         err "Control port not reachable. Is Ghostly active?"
         return 1
     }
@@ -1257,8 +1359,9 @@ rotate_tor() {
     local cookie_hex
     cookie_hex="$(xxd -p "$COOKIE_FILE" 2>/dev/null | tr -d '\n')"
 
-    printf "AUTHENTICATE %s\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$cookie_hex" \
-        | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" >/dev/null 2>&1
+    tcp_send 127.0.0.1 "$TOR_CONTROL_PORT" \
+        "$(printf "AUTHENTICATE %s\r\nSIGNAL NEWNYM\r\nQUIT\r\n" "$cookie_hex")" \
+        >/dev/null 2>&1
 
     log "Waiting 10s for new circuit..."
     sleep 10
@@ -1308,12 +1411,12 @@ status_ghostly() {
     service_active && echo "active" || echo "inactive"
 
     echo -n "  SOCKS port     : "
-    nc -z 127.0.0.1 "$TOR_PORT" 2>/dev/null \
+    tcp_check 127.0.0.1 "$TOR_PORT" 2>/dev/null \
         && echo -e "${GREEN}open (${TOR_PORT})${NC}" \
         || echo -e "${RED}CLOSED${NC}"
 
     echo -n "  Control port   : "
-    nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
+    tcp_check 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
         && echo "open ($TOR_CONTROL_PORT)" \
         || echo -e "${RED}CLOSED${NC}"
 
@@ -1482,8 +1585,8 @@ diagnostics() {
     echo
     echo -e "${BOLD}── Tor Service ──${NC}"
     echo "  Service status : $(service_active && echo active || echo inactive)"
-    echo "  SOCKS port     : $(nc -z 127.0.0.1 $TOR_PORT 2>/dev/null && echo -e "${GREEN}OPEN${NC}" || echo -e "${RED}CLOSED${NC}")"
-    echo "  Control port   : $(nc -z 127.0.0.1 $TOR_CONTROL_PORT 2>/dev/null && echo "open ($TOR_CONTROL_PORT)" || echo -e "${RED}CLOSED${NC}")"
+    echo "  SOCKS port     : $(tcp_check 127.0.0.1 $TOR_PORT 2>/dev/null && echo -e "${GREEN}OPEN${NC}" || echo -e "${RED}CLOSED${NC}")"
+    echo "  Control port   : $(tcp_check 127.0.0.1 $TOR_CONTROL_PORT 2>/dev/null && echo "open ($TOR_CONTROL_PORT)" || echo -e "${RED}CLOSED${NC}")"
     echo "  Cookie file    : $([[ -f "$COOKIE_FILE" ]] && echo "EXISTS ($COOKIE_FILE)" || echo "MISSING")"
     echo "  torrc snippet  : $([[ -f "$TORRC_SNIPPET" ]] && echo "EXISTS" || echo "NOT FOUND")"
 
@@ -1497,17 +1600,17 @@ diagnostics() {
     echo
     echo -e "${BOLD}── Bootstrap & Circuit ──${NC}"
     local phase="N/A"
-    if nc -z 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
-        phase="$(echo -e "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
-            | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
+    if tcp_check 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null; then
+        phase="$(tcp_send 127.0.0.1 "$TOR_CONTROL_PORT" \
+            "AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n" \
             | grep "bootstrap-phase" | grep -o "PROGRESS=[0-9]*" \
             | cut -d= -f2 || echo "N/A")"
         echo "  Bootstrap      : ${phase}%"
 
         # Circuit establishment
         local circuit_status
-        circuit_status="$(echo -e "AUTHENTICATE\r\nGETINFO circuit-status\r\nQUIT\r\n" \
-            | nc -q1 127.0.0.1 "$TOR_CONTROL_PORT" 2>/dev/null \
+        circuit_status="$(tcp_send 127.0.0.1 "$TOR_CONTROL_PORT" \
+            "AUTHENTICATE\r\nGETINFO circuit-status\r\nQUIT\r\n" \
             | grep "^250+circuit-status" -A5 | grep "BUILT" | wc -l || echo 0)"
         echo "  Built circuits : ${circuit_status}"
     else
