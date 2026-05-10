@@ -1181,6 +1181,10 @@ start_ghostly() {
     if [[ "$RUNTIME_PROFILE" == "wsl" ]]; then
         echo
         info "WSL SOCKS5 proxy: 127.0.0.1:${TOR_PORT}"
+        info "Enable shell proxy:"
+        info "  eval \"\$(ghostly env)\""
+        info "Disable shell proxy:"
+        info "  eval \"\$(ghostly unset-env)\""
         info "Export for shell: export https_proxy=socks5h://127.0.0.1:${TOR_PORT}"
         info "                  export http_proxy=socks5h://127.0.0.1:${TOR_PORT}"
     fi
@@ -1643,10 +1647,37 @@ menu() {
 ############################
 # MAIN
 ############################
+proxy_env() {
+cat <<EOF
+export http_proxy="socks5h://127.0.0.1:${TOR_PORT}"
+export https_proxy="socks5h://127.0.0.1:${TOR_PORT}"
+export HTTP_PROXY="socks5h://127.0.0.1:${TOR_PORT}"
+export HTTPS_PROXY="socks5h://127.0.0.1:${TOR_PORT}"
+export all_proxy="socks5h://127.0.0.1:${TOR_PORT}"
+export ALL_PROXY="socks5h://127.0.0.1:${TOR_PORT}"
+EOF
+}
+
+proxy_unset() {
+cat <<EOF
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset all_proxy
+unset ALL_PROXY
+EOF
+}
 
 mkdir -p "$(dirname "$LOG_FILE")" "$CONFIG_DIR" "$BACKUP_DIR"
 
 case "${1:-}" in
+    env)
+        proxy_env
+        ;;
+    unset-env)
+        proxy_unset
+        ;;
     install)
         require_root
         install_deps
