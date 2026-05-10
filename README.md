@@ -1,257 +1,311 @@
-# 👻 Ghostly
+# Ghostly
 
-A production-grade adaptive anonymity toolkit for Linux. Automatically detects your runtime environment and configures the optimal Tor anonymity strategy — full transparent routing on bare metal, SOCKS-only safe mode on WSL/containers, with automatic fallback and zero-lockout rollback protection.
+**Toolkit Anonimitas Adaptif Tingkat Produksi**
 
-> ⚠️ **For legal and ethical use only.** Intended for privacy-conscious users, security researchers, journalists, and penetration testers working in authorized environments.
-
----
-
-## Features
-
-- 🧠 **Adaptive runtime profiles** — auto-detects baremetal, VM, cloud, WSL, container
-- 🔀 **Automatic routing mode selection** — transparent or SOCKS-only, based on environment
-- 🔄 **Transparent → SOCKS fallback** — if transparent mode fails, downgrades automatically
-- 🔒 **Full transparent Tor routing** — iptables-based on supported environments
-- 🛡️ **Kill-switch firewall** — OUTPUT DROP applied *only after* Tor verified
-- 🔐 **Startup verification chain** — service → SOCKS → bootstrap → IsTor=true
-- 🎭 **Smart MAC spoofing** — auto-skipped on WSL, Docker, Hyper-V, KVM, cloud
-- 🚫 **IPv6 disable** — kernel-level, skipped on cloud/container
-- 🔑 **Cookie authentication** — no plaintext passwords anywhere
-- 📁 **torrc.d snippet** — non-destructive Tor config
-- 🌐 **LAN exclusions** — `10.x`, `172.16.x`, `192.168.x` excluded in balanced/safe mode
-- 🩺 **Adaptive diagnostics** — profile capabilities, WSL warnings, bootstrap phase
-- ↩️ **Zero-lockout rollback** — `trap ERR` restores everything on any failure
-- 📋 **Timestamped logging** — `/var/log/ghostly.log`
+Ghostly adalah toolkit anonimitas berbasis Bash yang merutekan seluruh traffic sistem melalui jaringan Tor. Ghostly mendeteksi lingkungan runtime secara otomatis — bare metal, VM, cloud VPS, WSL, atau container — lalu menyesuaikan perilakunya: menerapkan transparent proxy penuh dengan kill-switch jika memungkinkan, atau turun ke mode SOCKS-only secara graceful ketika modifikasi kernel tidak tersedia.
 
 ---
 
-## Requirements
+## Fitur
 
-- Linux (Debian/Ubuntu recommended)
-- Root privileges
-- `systemd`
+- **Profil berbasis environment** — deteksi otomatis bare metal, VM, cloud, WSL, dan container; setiap profil hanya mengaktifkan fitur yang benar-benar berjalan di environment tersebut
+- **Transparent proxy** — mengalihkan seluruh traffic TCP dan DNS melalui Tor tanpa konfigurasi per-aplikasi (bare metal / VM / cloud)
+- **Fallback SOCKS-only** — mode aman untuk WSL dan container di mana modifikasi kernel tidak diizinkan
+- **Rantai verifikasi 4 langkah** — health service → SOCKS port → bootstrap 100% → konfirmasi IsTor
+- **Kill-switch** — set `OUTPUT DROP` setelah Tor dikonfirmasi; mencegah traffic bocor jika Tor mati
+- **Spoofing MAC address** — mengacak MAC saat startup (bare metal saja)
+- **Nonaktifkan IPv6** — memblokir vektor kebocoran IPv6 via sysctl
+- **Kunci DNS** — menulis `nameserver 127.0.0.1` dan mengunci `/etc/resolv.conf` secara immutable
+- **Rotasi sirkuit** — mengirim `SIGNAL NEWNYM` melalui control port dengan cookie auth
+- **Auto-rollback** — ERR trap memulihkan firewall, DNS, MAC, IPv6, dan route jika terjadi error
+- **Firewall idempoten** — memanggil `configure_firewall` dua kali tetap aman; tidak ada jendela bocor antara flush dan kill-switch
+- **Arsitektur torrc** — tidak pernah menimpa `/etc/tor/torrc`; semua konfigurasi runtime ditulis ke `/etc/tor/torrc.d/ghostly.conf`
 
 ---
 
-## Installation
+## Persyaratan
+
+- Linux (Debian/Ubuntu disarankan)
+- Bash 4.0+
+- Root / sudo
+
+Dependensi diinstal otomatis via `sudo ghostly install`:
+
+```
+tor  torsocks  proxychains4  macchanger  curl
+iptables  iptables-persistent  iproute2
+netcat-openbsd  socat  dnsutils  nftables  xxd
+```
+
+---
+
+## Instalasi
 
 ```bash
+# Clone repositori
 git clone https://github.com/hanzzly/ghostly
 cd ghostly
-chmod +x ghostly.sh
-sudo ln -s "$(pwd)/ghostly.sh" /usr/local/bin/ghostly
 
-sudo ghostly install
+# Instal dependensi
+sudo bash ghostly.sh install
+
+# Instal sebagai perintah sistem (opsional)
+sudo cp ghostly.sh /usr/local/bin/ghostly
+sudo chmod +x /usr/local/bin/ghostly
 ```
 
 ---
 
-## Usage
+## Mulai Cepat
 
 ```bash
-sudo ghostly on                      # Enable (auto-detect profile + mode)
-sudo ghostly on --mode strict        # Maximum privacy
-sudo ghostly on --mode safe          # Maximum stability
-sudo ghostly on --profile wsl        # Force a specific runtime profile
-sudo ghostly off                     # Disable & restore everything
-sudo ghostly rotate                  # Rotate Tor circuit (new identity)
-sudo ghostly status                  # Full status with profile info
-sudo ghostly leak-test               # Leak tests (routing-aware)
-sudo ghostly diag                    # Full environment diagnostics
-sudo ghostly menu                    # Interactive menu
-ghostly --version                    # Show version
+# Aktifkan dengan profil yang terdeteksi otomatis
+sudo ghostly on
+
+# Aktifkan dengan mode privasi tertentu
+sudo ghostly on --mode strict
+sudo ghostly on --mode balanced   # default
+sudo ghostly on --mode safe
+
+# Paksa profil runtime tertentu
+sudo ghostly on --profile wsl
+sudo ghostly on --profile baremetal
+
+# Cek status
+sudo ghostly status
+
+# Nonaktifkan dan pulihkan semua pengaturan
+sudo ghostly off
 ```
 
 ---
 
-## Runtime Profiles
+## Semua Perintah
 
-Ghostly automatically selects the right profile. You can also force one with `--profile`.
+| Perintah | Keterangan |
+|---|---|
+| `sudo ghostly install` | Instal semua dependensi via apt |
+| `sudo ghostly on` | Aktifkan — deteksi profil dan mode otomatis |
+| `sudo ghostly on --mode <mode>` | Aktifkan dengan mode privasi tertentu |
+| `sudo ghostly on --profile <profil>` | Paksa profil runtime tertentu |
+| `sudo ghostly off` | Nonaktifkan, pulihkan firewall / DNS / MAC / IPv6 |
+| `sudo ghostly rotate` | Minta sirkuit Tor baru (SIGNAL NEWNYM) |
+| `sudo ghostly status` | Dashboard status lengkap |
+| `sudo ghostly leak-test` | Tes kebocoran IP, DNS, IPv6, dan kill-switch |
+| `sudo ghostly diag` | Diagnostik environment dan konfigurasi mendalam |
+| `sudo ghostly fix-torrc` | Bersihkan konflik di `/etc/tor/torrc` lama |
+| `sudo ghostly menu` | Menu TUI interaktif |
+| `ghostly env` | Cetak ekspor variabel environment proxy |
+| `ghostly unset-env` | Cetak perintah hapus variabel environment proxy |
+| `ghostly --version` | Tampilkan versi |
 
-| Profile | Transparent | MAC Spoof | IPv6 Disable | DNS Lock | Kill-Switch |
-|---------|:-----------:|:---------:|:------------:|:--------:|:-----------:|
-| `baremetal` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `vm` | ✅ | ❌ | ✅ | ✅ | ✅ |
-| `cloud` | ✅ | ❌ | ❌ | ✅ | ✅ |
-| `wsl` | ❌ | ❌ | ✅ | ❌ | ❌ |
-| `container` | ❌ | ❌ | ❌ | ❌ | ❌ |
+---
 
-### WSL & Container: SOCKS-only mode
+## Mode Privasi
 
-On WSL and containers, Ghostly cannot modify kernel networking. Instead:
+Mode mengatur perilaku sirkuit Tor dan kebijakan routing LAN. Diatur via `--mode` atau variabel environment `GHOSTLY_MODE`.
+
+| Mode | Traffic LAN | Maks Sirkuit | Kapan Dipakai |
+|---|---|---|---|
+| `balanced` | Dikecualikan dari Tor | 32 | Default — keseimbangan privasi dan stabilitas |
+| `strict` | Juga dirutekan melalui Tor | 8 | Privasi maksimum; akses LAN bisa terganggu |
+| `safe` | Dikecualikan dari Tor | 64 | Stabilitas maksimum; pergantian sirkuit minimal |
 
 ```bash
-# Ghostly starts Tor and gives you SOCKS5 access:
+# Mode persisten via variabel environment
+export GHOSTLY_MODE=strict
+sudo ghostly on
+```
+
+> **Peringatan — strict mode di server cloud/remote:** mengaktifkan strict mode akan merutekan semua traffic termasuk SSH melalui Tor. Jika kill-switch aktif sebelum sesi SSH terbentuk melalui klien yang mendukung Tor, kamu akan terkunci. Whitelist IP manajemen sebelum mengaktifkan strict mode di server remote.
+
+---
+
+## Profil Runtime
+
+Ghostly mendeteksi environment menggunakan strategi 3 lapis: `systemd-detect-virt` → pengecekan manual `/proc` → fallback konservatif. Setiap profil hanya mengaktifkan fitur yang aman dan fungsional di environment tersebut.
+
+| Profil | Routing | Spoof MAC | Nonaktifkan IPv6 | Kunci DNS | Kill-switch |
+|---|---|---|---|---|---|
+| `baremetal` | Transparent | ✓ | ✓ | ✓ | ✓ |
+| `vm` | Transparent | — | ✓ | ✓ | ✓ |
+| `cloud` | Transparent | — | — | ✓ | ✓ |
+| `wsl` | SOCKS-only | — | — | — | — |
+| `container` | SOCKS-only | — | — | — | — |
+
+### Profil SOCKS-only (WSL / container)
+
+Di WSL dan container, Ghostly menjalankan Tor dan mengekspos proxy SOCKS5 di `127.0.0.1:9050`. Tidak ada perubahan kernel yang dilakukan. Aplikasi harus dikonfigurasi secara eksplisit untuk menggunakan proxy ini.
+
+```bash
+# Terapkan ke shell saat ini
+eval "$(ghostly env)"
+
+# Atau ekspor manual
 export https_proxy=socks5h://127.0.0.1:9050
 export http_proxy=socks5h://127.0.0.1:9050
 
-# curl direct:
-curl --socks5-hostname 127.0.0.1:9050 https://ipinfo.io/ip
-
-# proxychains:
-proxychains4 curl https://ipinfo.io/ip
+# Hapus proxy dari shell
+eval "$(ghostly unset-env)"
 ```
 
 ---
 
-## Detection Logic
+## Cara Kerja
+
+### Urutan startup
 
 ```
-1. systemd-detect-virt           (primary — most reliable)
-2. /.dockerenv                   (Docker/Podman fallback)
-3. /proc/version grep microsoft  (WSL fallback)
-4. /proc/1/environ container=lxc (LXC fallback)
-5. /run/systemd/container        (systemd-nspawn)
-
-Detected virt string → canonical profile:
-  none / bare-metal  → baremetal
-  wsl / wsl2         → wsl
-  docker / podman    → container
-  lxc / openvz       → container
-  kvm / vmware / xen → vm
-  amazon / azure     → cloud
+detect_environment → resolve_profile
+        ↓
+  configure_tor        (sanitasi torrc, tulis ghostly.conf, validasi, restart)
+        ↓
+  spoof_mac            (bare metal saja)
+        ↓
+  disable_ipv6         (bare metal / vm / cloud)
+        ↓
+  configure_firewall   (profil transparent saja — OUTPUT=ACCEPT)
+        ↓
+  rantai verifikasi:
+    [1] service aktif?
+    [2] SOCKS port terbuka?
+    [3] bootstrap 100%?  (control port primer, journal fallback)
+    [4] IsTor dikonfirmasi? (check.torproject.org/api/ip)
+        ↓
+  configure_dns        (kunci resolv.conf ke 127.0.0.1)
+        ↓
+  apply_killswitch     (OUTPUT → DROP)
+        ↓
+  save_state
 ```
 
----
+Jika langkah 3 gagal pada profil transparent, Ghostly otomatis turun ke mode SOCKS-only dan menjalankan ulang rantai verifikasi sebelum menyerah.
 
-## Privacy Modes
+### Arsitektur torrc
 
-| Mode | LAN Excluded | Circuits | StrictNodes | Use Case |
-|------|:---:|:---:|:---:|---------|
-| `balanced` | ✅ | 32 | No | Default |
-| `strict` | ❌ | 8 | Yes | Maximum anonymity |
-| `safe` | ✅ | 64 | No | VM/unstable environments |
-
-Modes combine with profiles. For example: `vm` + `strict` = transparent routing (kernel-level), no LAN exclusion, 8 circuits.
-
----
-
-## Startup Verification Chain
-
-Ghostly runs 4 verification steps before activating the kill-switch:
+Ghostly tidak pernah menulis direktif runtime ke `/etc/tor/torrc`. Semua konfigurasi diisolasi di `/etc/tor/torrc.d/ghostly.conf`.
 
 ```
-[1/4] Tor service active       → systemctl is-active tor
-[2/4] SOCKS port open          → nc -z 127.0.0.1:9050
-[3/4] Bootstrap 100%           → journalctl + control port GETINFO
-[4/4] IsTor=true               → check.torproject.org/api/ip
-         ↓ pass                        ↓ fail
-  Lock DNS → Kill-switch       Transparent → SOCKS fallback
-                                       ↓ also fail
-                                   Full rollback
+/etc/tor/torrc              ← bootstrap minimal (include saja)
+/etc/tor/torrc.d/
+    ghostly.conf            ← semua konfigurasi runtime (dikelola Ghostly)
 ```
 
-Kill-switch (`OUTPUT DROP`) is **never** applied before step 4 passes.
+Saat pertama kali dijalankan, jika `/etc/tor/torrc` mengandung direktif yang konflik (misal `SocksPort`, `ControlPort`, `TransPort`), Ghostly akan membersihkannya secara otomatis dan membackup file asli ke `/var/lib/ghostly/torrc.original.bak`.
 
----
-
-## Automatic Fallback
-
-If transparent routing fails verification, Ghostly automatically downgrades:
-
-```
-transparent mode failed
-  → restore firewall (OUTPUT ACCEPT)
-  → reconfigure Tor without TransPort/DNSPort
-  → re-run verification chain in SOCKS-only mode
-  → if passes: continue in SOCKS fallback mode
-  → if fails: full rollback, exit cleanly
-```
-
-Status will show `routing: socks-only (fallback)` when this occurs.
-
----
-
-## Rollback Protection
-
-Every startup step is wrapped in `trap cleanup_on_error ERR`:
-
-```
-Any error →
-  OUTPUT ACCEPT  (immediate, prevents lockout)
-  restore iptables
-  restore resolv.conf
-  restore MAC address
-  re-enable IPv6
-  restore routing table
-  stop Tor
-  remove torrc.d snippet
-  clear state file
-```
-
-Your internet connection survives any failure.
-
----
-
-## Tor Config (torrc.d)
-
-Ghostly writes a profile-aware snippet to `/etc/tor/torrc.d/ghostly.conf` and adds a `%include` to the main `torrc`. Your existing Tor config is never overwritten.
-
-**baremetal/vm/cloud snippet includes:**
-```
-SocksPort, ControlPort, CookieAuthentication
-TransPort 9040 IsolateClientAddr IsolateClientProtocol
-DNSPort 5353
-VirtualAddrNetworkIPv4, AutomapHostsOnResolve
-```
-
-**wsl/container snippet includes:**
-```
-SocksPort, ControlPort, CookieAuthentication
-# (no TransPort, no DNSPort)
-```
-
----
-
-## File Locations
-
-| Path | Purpose |
-|------|---------|
-| `/etc/ghostly/` | Config directory |
-| `/etc/tor/torrc.d/ghostly.conf` | Tor config snippet |
-| `/var/lib/ghostly/iptables.bak` | Firewall backup |
-| `/var/lib/ghostly/resolv.conf.bak` | DNS backup |
-| `/var/lib/ghostly/routes.bak` | Routing table backup |
-| `/var/lib/ghostly/state` | Active state file |
-| `/var/log/ghostly.log` | Timestamped activity log |
-| `/run/tor/control.authcookie` | Tor cookie (root-readable) |
-| `/etc/sysctl.d/99-ghostly-no-ipv6.conf` | IPv6 disable persistence |
-
----
-
-## Diagnostics
+Untuk membersihkan torrc secara manual:
 
 ```bash
+sudo ghostly fix-torrc
 sudo ghostly diag
 ```
 
-Reports:
+### Aturan firewall (mode transparent)
 
-- Runtime profile + capability matrix
-- WSL/container compatibility warnings
-- Tor service status + bootstrap phase (live from control port)
-- Active torrc.d snippet
-- Firewall OUTPUT chain rules
-- Network manager + firewall backend detection
-- DNS and IPv6 status
+```
+INPUT   → DROP (default)
+FORWARD → DROP (default)
+OUTPUT  → ACCEPT → DROP setelah kill-switch aktif
 
----
-
-## Limitations
-
-- **WebRTC**: Cannot be blocked at the OS level. Check at [browserleaks.com/webrtc](https://browserleaks.com/webrtc) or use Tor Browser.
-- **UDP (non-DNS)**: Tor only carries TCP. Non-DNS UDP is dropped by the kill-switch.
-- **WSL kill-switch**: Not possible in WSL — use SOCKS5 proxy per-application.
-- **Performance**: Traffic through Tor will be slower. Expected behavior.
+NAT OUTPUT:
+  127.0.0.0/8        → RETURN  (bypass loopback)
+  uid daemon tor     → RETURN  (Tor sendiri bypass redirect)
+  rentang LAN        → RETURN  (kecuali strict mode)
+  TCP --syn          → REDIRECT → :9040 (TransPort)
+  UDP/TCP port 53    → REDIRECT → :5353 (DNSPort)
+```
 
 ---
 
-## Disclaimer
+## Lokasi File
 
-This tool is provided for **educational and legitimate privacy use only**. The author is not responsible for any misuse. Always comply with the laws of your jurisdiction.
+| Path | Fungsi |
+|---|---|
+| `/etc/tor/torrc.d/ghostly.conf` | Konfigurasi Tor runtime |
+| `/etc/tor/torrc` | Bootstrap minimal (include saja) |
+| `/var/lib/ghostly/state` | State sesi aktif |
+| `/var/lib/ghostly/iptables.bak` | Backup firewall (dipulihkan saat `off`) |
+| `/var/lib/ghostly/resolv.conf.bak` | Backup DNS (dipulihkan saat `off`) |
+| `/var/lib/ghostly/torrc.original.bak` | torrc asli sebelum sanitasi |
+| `/var/log/ghostly.log` | Log operasi |
+| `/run/tor/control.authcookie` | Cookie control port Tor |
 
 ---
 
-## License
+## Variabel Environment
 
-MIT — see [LICENSE](LICENSE)
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `GHOSTLY_MODE` | `balanced` | Mode privasi (`strict` / `balanced` / `safe`) |
+
+---
+
+## Port
+
+| Port | Fungsi |
+|---|---|
+| `9050` | Proxy SOCKS5 Tor |
+| `9040` | TransPort Tor (redirect TCP transparent) |
+| `5353` | DNSPort Tor (redirect DNS) |
+| `9051` | Control port Tor |
+
+---
+
+## Pemecahan Masalah
+
+**Tor gagal start — "Address already in use"**
+
+File `/etc/tor/torrc` kemungkinan memiliki direktif port yang konflik dari instalasi Tor sebelumnya.
+
+```bash
+sudo ghostly fix-torrc
+sudo ghostly diag
+```
+
+**Bootstrap timeout**
+
+```bash
+sudo ghostly diag     # menampilkan % bootstrap live dan log Tor terbaru
+sudo ghostly rotate   # minta sirkuit baru
+```
+
+**SSH terputus setelah mengaktifkan strict mode di server cloud**
+
+Strict mode merutekan semua traffic termasuk koneksi SSH melalui Tor. Aktifkan kembali melalui konsol VPS dan ganti ke mode `balanced`:
+
+```bash
+sudo ghostly off
+sudo ghostly on --mode balanced
+```
+
+**WSL: proxy tidak berjalan setelah diaktifkan**
+
+WSL tidak dapat memodifikasi kernel networking. Terapkan proxy ke shell secara manual:
+
+```bash
+eval "$(ghostly env)"
+curl https://check.torproject.org/api/ip
+```
+
+**Verifikasi Tor aktif**
+
+```bash
+sudo ghostly status
+sudo ghostly leak-test
+```
+
+---
+
+## Catatan Keamanan
+
+- Ghostly menggunakan **cookie authentication** untuk control port Tor. Tidak ada password plaintext yang disimpan.
+- Kill-switch mengset `iptables OUTPUT DROP` setelah Tor dikonfirmasi. Jika Tor crash setelah aktivasi, semua traffic keluar diblokir sampai `sudo ghostly off` dijalankan.
+- Spoofing MAC hanya berlaku pada interface default. Dilewati pada profil VM, cloud, WSL, dan container karena tidak berpengaruh atau tidak tersedia.
+- Pada profil cloud, IPv6 sengaja dibiarkan aktif — penyedia cloud sering menggunakan IPv6 untuk akses management plane. Pastikan traffic IPv6 tidak membocorkan data sensitif jika ini menjadi perhatian.
+- `strict` mode menonaktifkan pengecualian LAN. Semua traffic termasuk LAN, SSH, dan antarmuka manajemen dialihkan melalui Tor.
+
+---
+
+## Lisensi
+
+MIT — lihat [LICENSE](LICENSE)
