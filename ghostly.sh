@@ -1207,6 +1207,8 @@ start_ghostly() {
 stop_ghostly() {
     require_root
 
+    detect_environment
+
     log "==============================="
     log "  Stopping Ghostly"
     log "==============================="
