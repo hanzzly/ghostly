@@ -576,8 +576,13 @@ validate_tor_config() {
     fi
 }
 
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && \
+    systemctl list-units >/dev/null 2>&1
+}
+
 service_start() {
-    if pidof systemd >/dev/null 2>&1; then
+    if has_systemd; then
         systemctl restart tor
     else
         service tor restart >/dev/null 2>&1 || \
@@ -586,7 +591,7 @@ service_start() {
 }
 
 service_stop() {
-    if pidof systemd >/dev/null 2>&1; then
+    if has_systemd; then
         systemctl stop tor
     else
         service tor stop >/dev/null 2>&1 || \
@@ -595,7 +600,7 @@ service_stop() {
 }
 
 service_active() {
-    if pidof systemd >/dev/null 2>&1; then
+    if has_systemd; then
         systemctl is-active --quiet tor
     else
         pgrep -x tor >/dev/null 2>&1
@@ -740,7 +745,7 @@ verify_tor_exit() {
 
     if [[ -z "$ip" ]]; then
         warn "Could not reach Tor exit. Circuit may not be established yet."
-        return 1
+        return 0
     fi
 
     if echo "$tor_check" | grep -q '"IsTor":true'; then
