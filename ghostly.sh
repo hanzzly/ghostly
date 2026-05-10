@@ -132,11 +132,16 @@ require_root() {
 
 check_deps() {
     local missing=()
+
     for bin in tor nc ip sysctl curl; do
         command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
     done
-    [[ ${#missing[@]} -gt 0 ]] && \
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
         die "Missing: ${missing[*]}. Run: sudo ghostly install"
+    fi
+
+    return 0
 }
 
 ############################
